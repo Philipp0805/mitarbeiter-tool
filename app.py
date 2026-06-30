@@ -140,29 +140,34 @@ with tab_mitarbeiter:
     if not skills:
         st.warning("Lege zuerst im Tab „Fähigkeiten“ mindestens eine Fähigkeit an.")
     else:
-        with st.form("ma_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            name = col1.text_input("Name")
-            stunden = col2.number_input("Wochenstunden", min_value=1.0, max_value=80.0, value=40.0, step=0.5)
+        # Bewusst KEIN st.form: so erscheinen die Slider sofort beim Auswaehlen
+        # einer Faehigkeit, nicht erst nach dem Speichern.
+        col1, col2 = st.columns(2)
+        name = col1.text_input("Name", key="neu_name")
+        stunden = col2.number_input(
+            "Wochenstunden", min_value=1.0, max_value=80.0, value=40.0, step=0.5,
+            key="neu_stunden",
+        )
 
-            st.markdown("**Fähigkeiten & Level** (1 = Anfänger … 5 = Experte)")
-            ausgewaehlt = st.multiselect(
-                "Welche Fähigkeiten hat diese Person?",
-                options=[s["id"] for s in skills],
-                format_func=lambda sid: next(s["name"] for s in skills if s["id"] == sid),
-            )
-            level_map = {}
-            for sid in ausgewaehlt:
-                sname = next(s["name"] for s in skills if s["id"] == sid)
-                level_map[sid] = st.slider(f"Level: {sname}", 1, 5, 3, key=f"lvl_{sid}")
+        st.markdown("**Fähigkeiten & Level** (1 = Anfänger … 5 = Experte)")
+        ausgewaehlt = st.multiselect(
+            "Welche Fähigkeiten hat diese Person?",
+            options=[s["id"] for s in skills],
+            format_func=lambda sid: next(s["name"] for s in skills if s["id"] == sid),
+            key="neu_skills",
+        )
+        level_map = {}
+        for sid in ausgewaehlt:
+            sname = next(s["name"] for s in skills if s["id"] == sid)
+            level_map[sid] = st.slider(f"Level: {sname}", 1, 5, 3, key=f"neu_lvl_{sid}")
 
-            if st.form_submit_button("Mitarbeiter speichern"):
-                if name.strip():
-                    core.mitarbeiter_anlegen(name, stunden, level_map)
-                    st.success(f"„{name}“ gespeichert.")
-                    st.rerun()
-                else:
-                    st.error("Bitte einen Namen eingeben.")
+        if st.button("Mitarbeiter speichern", key="neu_speichern"):
+            if name.strip():
+                core.mitarbeiter_anlegen(name, stunden, level_map)
+                st.success(f"„{name}“ gespeichert.")
+                st.rerun()
+            else:
+                st.error("Bitte einen Namen eingeben.")
 
     st.divider()
     st.subheader("Team")
@@ -170,16 +175,52 @@ with tab_mitarbeiter:
     if not ma:
         st.info("Noch keine Mitarbeiter angelegt.")
     for m in ma:
-        c1, c2, c3, c4 = st.columns([3, 2, 4, 1])
+        c1, c2, c3 = st.columns([3, 2, 4])
         c1.markdown(f"**{m['name']}**")
         c2.markdown(f"{m['frei']:.1f} / {m['wochenstunden']:.0f} h frei")
         skill_pills = " ".join(
             f"<span class='pill'>{s['name']} · {s['level']}</span>" for s in m["skills"]
         ) or "<span class='pill'>keine Fähigkeiten</span>"
         c3.markdown(skill_pills, unsafe_allow_html=True)
-        if c4.button("Löschen", key=f"del_ma_{m['id']}"):
-            core.mitarbeiter_loeschen(m["id"])
-            st.rerun()
+
+        # --- Bearbeiten / Loeschen im aufklappbaren Bereich ---
+        with st.expander("Bearbeiten"):
+            if not skills:
+                st.info("Erst Fähigkeiten anlegen, um Skills zuweisen zu können.")
+            e1, e2 = st.columns(2)
+            e_name = e1.text_input("Name", value=m["name"], key=f"edit_name_{m['id']}")
+            e_stunden = e2.number_input(
+                "Wochenstunden", min_value=1.0, max_value=80.0,
+                value=float(m["wochenstunden"]), step=0.5, key=f"edit_std_{m['id']}",
+            )
+
+            vorhandene = {s["id"]: s["level"] for s in m["skills"]}
+            e_auswahl = st.multiselect(
+                "Fähigkeiten",
+                options=[s["id"] for s in skills],
+                default=[sid for sid in vorhandene if sid in [s["id"] for s in skills]],
+                format_func=lambda sid: next(s["name"] for s in skills if s["id"] == sid),
+                key=f"edit_skills_{m['id']}",
+            )
+            e_level_map = {}
+            for sid in e_auswahl:
+                sname = next(s["name"] for s in skills if s["id"] == sid)
+                e_level_map[sid] = st.slider(
+                    f"Level: {sname}", 1, 5, int(vorhandene.get(sid, 3)),
+                    key=f"edit_lvl_{m['id']}_{sid}",
+                )
+
+            b1, b2 = st.columns(2)
+            if b1.button("Änderungen speichern", key=f"edit_save_{m['id']}"):
+                if e_name.strip():
+                    core.mitarbeiter_aktualisieren(m["id"], e_name, e_stunden, e_level_map)
+                    st.success("Gespeichert.")
+                    st.rerun()
+                else:
+                    st.error("Bitte einen Namen eingeben.")
+            if b2.button("Mitarbeiter löschen", key=f"del_ma_{m['id']}"):
+                core.mitarbeiter_loeschen(m["id"])
+                st.rerun()
 
 
 # --------------------------------------------------------------------------
