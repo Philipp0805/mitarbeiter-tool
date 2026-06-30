@@ -212,6 +212,25 @@ with tab_mitarbeiter:
                 core.mitarbeiter_loeschen(m["id"])
                 st.rerun()
 
+            st.markdown("---")
+            st.markdown("**Abweichende Arbeitszeit (einzelne Tage)**")
+            st.caption("Brutto-Stunden für einen Tag (z. B. 0 = Urlaub). "
+                       "Die Effektivität wird darauf noch angewandt.")
+            ausnahmen = core.tagesarbeitszeit_liste(m["id"])
+            for ax in ausnahmen:
+                ca, cb, cc = st.columns([2, 2, 1])
+                ca.markdown(f"{ax['datum'].strftime('%d.%m.%Y')}")
+                cb.markdown(f"{ax['brutto_stunden']:.1f} h brutto")
+                if cc.button("✕", key=f"axdel_{m['id']}_{ax['datum']}"):
+                    core.tagesarbeitszeit_loeschen(m["id"], ax["datum"])
+                    st.rerun()
+            na1, na2, na3 = st.columns([2, 2, 1])
+            ax_datum = na1.date_input("Datum", value=date.today(), key=f"axd_{m['id']}")
+            ax_std = na2.number_input("Brutto-Stunden", 0.0, 24.0, 0.0, 0.5, key=f"axs_{m['id']}")
+            if na3.button("Setzen", key=f"axset_{m['id']}"):
+                core.tagesarbeitszeit_setzen(m["id"], ax_datum, ax_std)
+                st.rerun()
+
 
 # ==========================================================================
 # Tab: Aufträge
@@ -481,14 +500,29 @@ with tab_kalender:
             ist_we = t.weekday() >= 5
             if ist_feiertag or ist_we:
                 zelle = "<td style='background:#e9ecef'></td>"
-            elif info and info["stunden"] > 0:
-                bg = farbe(info["stunden"], m["tageskapazitaet"])
-                deadline = "🚩" if info["deadlines"] else ""
-                titel = " | ".join(info["vorgaenge"])
-                zelle = (f"<td style='background:{bg}' title='{titel}'>"
-                         f"{info['stunden']:.1f}{deadline}</td>")
             else:
-                zelle = "<td></td>"
+                # tagesgenaue Kapazität (Ausnahme überschreibt Standard)
+                kap = info.get("kapazitaet", m["tageskapazitaet"]) if info else m["tageskapazitaet"]
+                ausnahme = info.get("ausnahme") if info else False
+                stunden = info["stunden"] if info else 0.0
+
+                if kap <= 0:
+                    # z. B. Urlaub: keine Kapazität
+                    inhalt = "U" if ausnahme else ""
+                    zelle = f"<td style='background:#dfe3e8' title='keine Kapazität (z. B. Urlaub)'>{inhalt}</td>"
+                elif stunden > 0:
+                    bg = farbe(stunden, kap)
+                    deadline = "🚩" if info["deadlines"] else ""
+                    rand = "border:2px solid #7a8699;" if ausnahme else ""
+                    titel = " | ".join(info["vorgaenge"]) + f" (Kap. {kap:.1f} h)"
+                    zelle = (f"<td style='background:{bg};{rand}' title='{titel}'>"
+                             f"{stunden:.1f}{deadline}</td>")
+                else:
+                    # frei, aber evtl. mit reduzierter Kapazität (Ausnahme)
+                    if ausnahme:
+                        zelle = f"<td style='border:2px solid #7a8699' title='reduziert: {kap:.1f} h'><small>{kap:.0f}h</small></td>"
+                    else:
+                        zelle = "<td></td>"
             zeile += zelle
         zeile += "</tr>"
         zeilen += zeile
@@ -498,8 +532,21 @@ with tab_kalender:
             f"<div style='overflow-x:auto'><table class='cal'>{header}{zeilen}</table></div>",
             unsafe_allow_html=True,
         )
-        st.caption("🚩 = Vorgangs-Deadline (Ende) an diesem Tag. "
-                   "Grün = locker, Gelb = voll, Rot = über Kapazität. "
-                   "Mit der Maus über eine Zelle: zugehörige Vorgänge.")
+        st.caption("🚩 = Vorgangs-Deadline · U = kein Arbeitstag (z. B. Urlaub) · "
+                   "dicker Rahmen = abweichende Arbeitszeit hinterlegt. "
+                   "Grün = locker, Gelb = voll, Rot = über Kapazität.")
+
+        # --- Tagesarbeitszeit direkt im Kalender setzen ---
+        st.markdown("**Arbeitszeit für einen Tag anpassen**")
+        alle_ma = core.mitarbeiter_liste()
+        k1, k2, k3, k4 = st.columns([3, 2, 2, 1])
+        msel = k1.selectbox("Mitarbeiter", options=[mm["id"] for mm in alle_ma],
+                            format_func=lambda mid: next(mm["name"] for mm in alle_ma if mm["id"] == mid),
+                            key="cal_ma") if alle_ma else None
+        kdatum = k2.date_input("Tag", value=daten["erster"], key="cal_axd")
+        kstd = k3.number_input("Brutto-Stunden", 0.0, 24.0, 0.0, 0.5, key="cal_axs")
+        if k4.button("Setzen", key="cal_axset") and msel:
+            core.tagesarbeitszeit_setzen(msel, kdatum, kstd)
+            st.rerun()
     else:
         st.info("Noch keine Mitarbeiter angelegt.")
