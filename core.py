@@ -1,44 +1,43 @@
 """
-core.py – Datenhaltung (PostgreSQL) und Zuordnungslogik (Scoring).
+core.py – Datenhaltung (PostgreSQL) und Logik für den Auftragsplaner.
 
-Verbindung wird aus st.secrets["db_url"] gelesen (lokal: .streamlit/secrets.toml,
-in der Cloud: über die Secrets-Oberfläche von Streamlit).
-
-Trennt die Geschäftslogik sauber von der Oberfläche (app.py).
+Datenmodell:
+  gruppen            – Mitarbeitergruppen (Konstruktion, Produktion, ...)
+  vorgangstypen      – Typen von Vorgängen, je an eine Gruppe gekoppelt
+  mitarbeiter        – inkl. gruppe und effektivitaet (%)
+  skills             – Fähigkeiten
+  mitarbeiter_skills – Skill-Level je Mitarbeiter
+  auftraege          – auftragsnummer, kunde, liefertermin, kommentar
+  vorgaenge          – mehrere pro Auftrag: typ, start/ende, stunden, zuweisung
+  vorgang_skills     – benötigte Fähigkeiten je Vorgang
 """
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, timedelta
 
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import streamlit as st
 
+try:
+    import holidays as _holidays_lib
+except ImportError:  # Bibliothek fehlt -> Kalender funktioniert ohne Feiertage
+    _holidays_lib = None
+
 
 def _db_url():
-    # In der Cloud und lokal identisch: aus den Streamlit-Secrets.
     return st.secrets["db_url"]
 
 
 # --------------------------------------------------------------------------
-# Verbindungs-Pool
-#
-# Frueher wurde bei JEDEM Klick eine neue Verbindung ueber das Internet zur
-# Datenbank aufgebaut und wieder geschlossen – das kostet jedes Mal mehrere
-# Sekunden. Stattdessen halten wir jetzt einen kleinen Pool offener
-# Verbindungen vor und verwenden sie wieder. @st.cache_resource sorgt dafuer,
-# dass der Pool nur einmal pro App-Prozess erstellt wird.
+# Verbindungs-Pool (offen halten statt bei jedem Klick neu verbinden)
 # --------------------------------------------------------------------------
 
 @st.cache_resource
 def _pool():
     return psycopg2.pool.SimpleConnectionPool(1, 5, dsn=_db_url())
 
-
-# --------------------------------------------------------------------------
-# Datenbank-Setup
-# --------------------------------------------------------------------------
 
 @contextmanager
 def get_conn():
@@ -51,13 +50,11 @@ def get_conn():
         conn.rollback()
         raise
     finally:
-        # Verbindung NICHT schliessen, sondern in den Pool zuruecklegen.
         pool.putconn(conn)
 
 
 @contextmanager
 def get_cursor():
-    """Cursor, der Zeilen als dict-artige Objekte liefert."""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
@@ -66,21 +63,37 @@ def get_cursor():
             cur.close()
 
 
+# --------------------------------------------------------------------------
+# Setup
+# --------------------------------------------------------------------------
+
 def init_db():
-    """Legt alle Tabellen an, falls sie noch nicht existieren."""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS mitarbeiter (
-                id              SERIAL PRIMARY KEY,
-                name            TEXT NOT NULL,
-                wochenstunden   REAL NOT NULL DEFAULT 40
+            CREATE TABLE IF NOT EXISTS gruppen (
+                id    SERIAL PRIMARY KEY,
+                name  TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS vorgangstypen (
+                id        SERIAL PRIMARY KEY,
+                name      TEXT NOT NULL UNIQUE,
+                gruppe_id INTEGER REFERENCES gruppen(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS skills (
                 id    SERIAL PRIMARY KEY,
                 name  TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS mitarbeiter (
+                id              SERIAL PRIMARY KEY,
+                name            TEXT NOT NULL,
+                wochenstunden   REAL NOT NULL DEFAULT 40,
+                effektivitaet   REAL NOT NULL DEFAULT 100,  -- Prozent
+                gruppe_id       INTEGER REFERENCES gruppen(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS mitarbeiter_skills (
@@ -92,23 +105,116 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS auftraege (
                 id              SERIAL PRIMARY KEY,
+                auftragsnummer  TEXT,
                 titel           TEXT NOT NULL,
-                stunden         REAL NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'offen',
-                mitarbeiter_id  INTEGER REFERENCES mitarbeiter(id) ON DELETE SET NULL,
+                kunde           TEXT,
+                liefertermin    DATE,
+                kommentar       TEXT,
                 erstellt_am     TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS auftrag_skills (
-                auftrag_id   INTEGER NOT NULL REFERENCES auftraege(id) ON DELETE CASCADE,
+            CREATE TABLE IF NOT EXISTS vorgaenge (
+                id              SERIAL PRIMARY KEY,
+                auftrag_id      INTEGER NOT NULL REFERENCES auftraege(id) ON DELETE CASCADE,
+                typ_id          INTEGER REFERENCES vorgangstypen(id) ON DELETE SET NULL,
+                stunden         REAL NOT NULL DEFAULT 0,
+                start_datum     DATE,
+                end_datum       DATE,
+                mitarbeiter_id  INTEGER REFERENCES mitarbeiter(id) ON DELETE SET NULL,
+                status          TEXT NOT NULL DEFAULT 'offen'
+            );
+
+            CREATE TABLE IF NOT EXISTS vorgang_skills (
+                vorgang_id   INTEGER NOT NULL REFERENCES vorgaenge(id) ON DELETE CASCADE,
                 skill_id     INTEGER NOT NULL REFERENCES skills(id)    ON DELETE CASCADE,
                 min_level    INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (auftrag_id, skill_id)
+                PRIMARY KEY (vorgang_id, skill_id)
             );
             """
         )
         conn.commit()
         cur.close()
+    _vorbelegung()
+
+
+def _vorbelegung():
+    """Legt Standard-Gruppen und -Vorgangstypen an, falls noch keine da sind."""
+    if gruppen_liste():
+        return
+    for g in ["Konstruktion", "Produktion"]:
+        gruppe_anlegen(g)
+    gmap = {g["name"]: g["id"] for g in gruppen_liste()}
+    vorgangstyp_anlegen("Konstruktion", gmap.get("Konstruktion"))
+    vorgangstyp_anlegen("Produktion", gmap.get("Produktion"))
+
+
+# --------------------------------------------------------------------------
+# Gruppen
+# --------------------------------------------------------------------------
+
+def gruppe_anlegen(name):
+    name = name.strip()
+    if not name:
+        return
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO gruppen (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+            (name,),
+        )
+        conn.commit()
+        cur.close()
+
+
+def gruppe_loeschen(gid):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM gruppen WHERE id = %s", (gid,))
+        conn.commit()
+        cur.close()
+
+
+def gruppen_liste():
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM gruppen ORDER BY name")
+        return [dict(r) for r in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------
+# Vorgangstypen
+# --------------------------------------------------------------------------
+
+def vorgangstyp_anlegen(name, gruppe_id):
+    name = name.strip()
+    if not name:
+        return
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO vorgangstypen (name, gruppe_id) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO UPDATE SET gruppe_id = EXCLUDED.gruppe_id",
+            (name, gruppe_id),
+        )
+        conn.commit()
+        cur.close()
+
+
+def vorgangstyp_loeschen(tid):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM vorgangstypen WHERE id = %s", (tid,))
+        conn.commit()
+        cur.close()
+
+
+def vorgangstypen_liste():
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT t.*, g.name AS gruppe_name "
+            "FROM vorgangstypen t LEFT JOIN gruppen g ON g.id = t.gruppe_id "
+            "ORDER BY t.name"
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 # --------------------------------------------------------------------------
@@ -139,13 +245,13 @@ def skills_liste():
 # Mitarbeiter
 # --------------------------------------------------------------------------
 
-def mitarbeiter_anlegen(name, wochenstunden, skill_level_map):
-    """skill_level_map: dict {skill_id: level}"""
+def mitarbeiter_anlegen(name, wochenstunden, effektivitaet, gruppe_id, skill_level_map):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO mitarbeiter (name, wochenstunden) VALUES (%s, %s) RETURNING id",
-            (name.strip(), float(wochenstunden)),
+            "INSERT INTO mitarbeiter (name, wochenstunden, effektivitaet, gruppe_id) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
+            (name.strip(), float(wochenstunden), float(effektivitaet), gruppe_id),
         )
         mid = cur.fetchone()[0]
         for skill_id, level in skill_level_map.items():
@@ -159,28 +265,15 @@ def mitarbeiter_anlegen(name, wochenstunden, skill_level_map):
         return mid
 
 
-def mitarbeiter_loeschen(mid):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM mitarbeiter WHERE id = %s", (mid,))
-        conn.commit()
-        cur.close()
-
-
-def mitarbeiter_aktualisieren(mid, name, wochenstunden, skill_level_map):
-    """
-    Ueberschreibt Name, Wochenstunden und Skills eines Mitarbeiters.
-    Die Skills werden komplett neu gesetzt (alte raus, neue rein).
-    """
+def mitarbeiter_aktualisieren(mid, name, wochenstunden, effektivitaet, gruppe_id, skill_level_map):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE mitarbeiter SET name = %s, wochenstunden = %s WHERE id = %s",
-            (name.strip(), float(wochenstunden), mid),
+            "UPDATE mitarbeiter SET name=%s, wochenstunden=%s, effektivitaet=%s, gruppe_id=%s "
+            "WHERE id=%s",
+            (name.strip(), float(wochenstunden), float(effektivitaet), gruppe_id, mid),
         )
-        cur.execute(
-            "DELETE FROM mitarbeiter_skills WHERE mitarbeiter_id = %s", (mid,)
-        )
+        cur.execute("DELETE FROM mitarbeiter_skills WHERE mitarbeiter_id = %s", (mid,))
         for skill_id, level in skill_level_map.items():
             cur.execute(
                 "INSERT INTO mitarbeiter_skills (mitarbeiter_id, skill_id, level) "
@@ -191,71 +284,80 @@ def mitarbeiter_aktualisieren(mid, name, wochenstunden, skill_level_map):
         cur.close()
 
 
+def mitarbeiter_loeschen(mid):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM mitarbeiter WHERE id = %s", (mid,))
+        conn.commit()
+        cur.close()
+
+
 def mitarbeiter_liste():
     with get_cursor() as cur:
-        cur.execute("SELECT * FROM mitarbeiter ORDER BY name")
+        cur.execute(
+            "SELECT m.*, g.name AS gruppe_name "
+            "FROM mitarbeiter m LEFT JOIN gruppen g ON g.id = m.gruppe_id "
+            "ORDER BY m.name"
+        )
         rows = [dict(r) for r in cur.fetchall()]
         for r in rows:
             cur.execute(
                 "SELECT s.id, s.name, ms.level "
-                "FROM mitarbeiter_skills ms "
-                "JOIN skills s ON s.id = ms.skill_id "
+                "FROM mitarbeiter_skills ms JOIN skills s ON s.id = ms.skill_id "
                 "WHERE ms.mitarbeiter_id = %s ORDER BY s.name",
                 (r["id"],),
             )
             r["skills"] = [dict(s) for s in cur.fetchall()]
             cur.execute(
-                "SELECT COALESCE(SUM(stunden), 0) AS s FROM auftraege "
+                "SELECT COALESCE(SUM(stunden),0) AS s FROM vorgaenge "
                 "WHERE mitarbeiter_id = %s AND status = 'zugewiesen'",
                 (r["id"],),
             )
             r["verplant"] = cur.fetchone()["s"]
-            r["frei"] = r["wochenstunden"] - r["verplant"]
+            # effektive Tageskapazitaet in Stunden (5-Tage-Woche)
+            r["tageskapazitaet"] = r["wochenstunden"] / 5.0 * (r["effektivitaet"] / 100.0)
         return rows
 
 
 # --------------------------------------------------------------------------
-# Auftraege
+# Aufträge
 # --------------------------------------------------------------------------
 
-def auftrag_anlegen(titel, stunden, skill_minlevel_map):
-    """skill_minlevel_map: dict {skill_id: min_level}"""
+def auftrag_anlegen(auftragsnummer, titel, kunde, liefertermin, kommentar):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO auftraege (titel, stunden, status, erstellt_am) "
-            "VALUES (%s, %s, 'offen', %s) RETURNING id",
-            (titel.strip(), float(stunden), datetime.now().isoformat(timespec="seconds")),
+            "INSERT INTO auftraege (auftragsnummer, titel, kunde, liefertermin, kommentar, erstellt_am) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (
+                (auftragsnummer or "").strip() or None,
+                titel.strip(),
+                (kunde or "").strip() or None,
+                liefertermin,
+                (kommentar or "").strip() or None,
+                date.today().isoformat(),
+            ),
         )
         aid = cur.fetchone()[0]
-        for skill_id, min_level in skill_minlevel_map.items():
-            cur.execute(
-                "INSERT INTO auftrag_skills (auftrag_id, skill_id, min_level) "
-                "VALUES (%s, %s, %s)",
-                (aid, skill_id, int(min_level)),
-            )
         conn.commit()
         cur.close()
         return aid
 
 
-def auftrag_zuweisen(aid, mid):
+def auftrag_aktualisieren(aid, auftragsnummer, titel, kunde, liefertermin, kommentar):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE auftraege SET mitarbeiter_id = %s, status = 'zugewiesen' WHERE id = %s",
-            (mid, aid),
-        )
-        conn.commit()
-        cur.close()
-
-
-def auftrag_freigeben(aid):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE auftraege SET mitarbeiter_id = NULL, status = 'offen' WHERE id = %s",
-            (aid,),
+            "UPDATE auftraege SET auftragsnummer=%s, titel=%s, kunde=%s, liefertermin=%s, kommentar=%s "
+            "WHERE id=%s",
+            (
+                (auftragsnummer or "").strip() or None,
+                titel.strip(),
+                (kunde or "").strip() or None,
+                liefertermin,
+                (kommentar or "").strip() or None,
+                aid,
+            ),
         )
         conn.commit()
         cur.close()
@@ -269,112 +371,373 @@ def auftrag_loeschen(aid):
         cur.close()
 
 
-def auftraege_liste(status=None):
+def auftraege_liste():
     with get_cursor() as cur:
-        if status:
-            cur.execute(
-                "SELECT * FROM auftraege WHERE status = %s ORDER BY erstellt_am DESC",
-                (status,),
-            )
-        else:
-            cur.execute("SELECT * FROM auftraege ORDER BY erstellt_am DESC")
+        cur.execute("SELECT * FROM auftraege ORDER BY erstellt_am DESC, id DESC")
         rows = [dict(r) for r in cur.fetchall()]
         for r in rows:
-            cur.execute(
-                "SELECT s.id, s.name, a.min_level "
-                "FROM auftrag_skills a JOIN skills s ON s.id = a.skill_id "
-                "WHERE a.auftrag_id = %s ORDER BY s.name",
-                (r["id"],),
-            )
-            r["skills"] = [dict(s) for s in cur.fetchall()]
-            if r["mitarbeiter_id"]:
-                cur.execute(
-                    "SELECT name FROM mitarbeiter WHERE id = %s", (r["mitarbeiter_id"],)
-                )
-                m = cur.fetchone()
-                r["mitarbeiter_name"] = m["name"] if m else "—"
-            else:
-                r["mitarbeiter_name"] = None
+            r["vorgaenge"] = vorgaenge_zu_auftrag(r["id"])
         return rows
 
 
 # --------------------------------------------------------------------------
-# Zuordnungslogik (Scoring)
+# Vorgänge
 # --------------------------------------------------------------------------
 
-# Gewichte – bestimmen, wie stark die einzelnen Faktoren ins Ranking eingehen.
-GEWICHT_SKILL = 0.5        # Wie gut passen die Faehigkeiten?
-GEWICHT_KAPAZITAET = 0.3   # Bleibt nach dem Auftrag noch Luft?
-GEWICHT_AUSGLEICH = 0.2    # Werden gering ausgelastete bevorzugt?
+def vorgang_anlegen(auftrag_id, typ_id, stunden, start_datum, end_datum, skill_minlevel_map):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO vorgaenge (auftrag_id, typ_id, stunden, start_datum, end_datum) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (auftrag_id, typ_id, float(stunden), start_datum, end_datum),
+        )
+        vid = cur.fetchone()[0]
+        for skill_id, min_level in skill_minlevel_map.items():
+            cur.execute(
+                "INSERT INTO vorgang_skills (vorgang_id, skill_id, min_level) "
+                "VALUES (%s, %s, %s)",
+                (vid, skill_id, int(min_level)),
+            )
+        conn.commit()
+        cur.close()
+        return vid
 
 
-def vorschlaege(auftrag_id, top_n=5):
+def vorgang_aktualisieren(vid, typ_id, stunden, start_datum, end_datum, skill_minlevel_map):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE vorgaenge SET typ_id=%s, stunden=%s, start_datum=%s, end_datum=%s WHERE id=%s",
+            (typ_id, float(stunden), start_datum, end_datum, vid),
+        )
+        cur.execute("DELETE FROM vorgang_skills WHERE vorgang_id = %s", (vid,))
+        for skill_id, min_level in skill_minlevel_map.items():
+            cur.execute(
+                "INSERT INTO vorgang_skills (vorgang_id, skill_id, min_level) "
+                "VALUES (%s, %s, %s)",
+                (vid, skill_id, int(min_level)),
+            )
+        conn.commit()
+        cur.close()
+
+
+def vorgang_loeschen(vid):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM vorgaenge WHERE id = %s", (vid,))
+        conn.commit()
+        cur.close()
+
+
+def vorgang_zuweisen(vid, mid):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE vorgaenge SET mitarbeiter_id=%s, status='zugewiesen' WHERE id=%s",
+            (mid, vid),
+        )
+        conn.commit()
+        cur.close()
+
+
+def vorgang_freigeben(vid):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE vorgaenge SET mitarbeiter_id=NULL, status='offen' WHERE id=%s",
+            (vid,),
+        )
+        conn.commit()
+        cur.close()
+
+
+def vorgaenge_zu_auftrag(aid):
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT v.*, t.name AS typ_name, t.gruppe_id, g.name AS gruppe_name, "
+            "       m.name AS mitarbeiter_name "
+            "FROM vorgaenge v "
+            "LEFT JOIN vorgangstypen t ON t.id = v.typ_id "
+            "LEFT JOIN gruppen g ON g.id = t.gruppe_id "
+            "LEFT JOIN mitarbeiter m ON m.id = v.mitarbeiter_id "
+            "WHERE v.auftrag_id = %s ORDER BY v.start_datum NULLS LAST, v.id",
+            (aid,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            cur.execute(
+                "SELECT s.id, s.name, vs.min_level "
+                "FROM vorgang_skills vs JOIN skills s ON s.id = vs.skill_id "
+                "WHERE vs.vorgang_id = %s ORDER BY s.name",
+                (r["id"],),
+            )
+            r["skills"] = [dict(s) for s in cur.fetchall()]
+        return rows
+
+
+def offene_vorgaenge():
+    """Alle noch nicht zugewiesenen Vorgänge, mit Auftrags-Kontext."""
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT v.*, t.name AS typ_name, t.gruppe_id, g.name AS gruppe_name, "
+            "       a.titel AS auftrag_titel, a.auftragsnummer, a.kunde, a.liefertermin "
+            "FROM vorgaenge v "
+            "LEFT JOIN vorgangstypen t ON t.id = v.typ_id "
+            "LEFT JOIN gruppen g ON g.id = t.gruppe_id "
+            "JOIN auftraege a ON a.id = v.auftrag_id "
+            "WHERE v.status = 'offen' "
+            "ORDER BY a.liefertermin NULLS LAST, v.start_datum NULLS LAST, v.id"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            cur.execute(
+                "SELECT s.id, s.name, vs.min_level "
+                "FROM vorgang_skills vs JOIN skills s ON s.id = vs.skill_id "
+                "WHERE vs.vorgang_id = %s ORDER BY s.name",
+                (r["id"],),
+            )
+            r["skills"] = [dict(s) for s in cur.fetchall()]
+        return rows
+
+
+# --------------------------------------------------------------------------
+# Zuordnungslogik (Scoring) – jetzt pro Vorgang, mit strikter Gruppenfilterung
+# --------------------------------------------------------------------------
+
+GEWICHT_SKILL = 0.5
+GEWICHT_KAPAZITAET = 0.3
+GEWICHT_AUSGLEICH = 0.2
+
+
+def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
     """
-    Liefert eine sortierte Liste von Vorschlaegen fuer einen Auftrag.
-
-    Jeder Eintrag enthaelt den Mitarbeiter, einen Score (0..1) und eine
-    nachvollziehbare Begruendung der Teil-Scores.
+    Liefert {date: stunden} der bereits zugewiesenen Vorgänge eines Mitarbeiters,
+    gleichmäßig über die jeweiligen Arbeitstage verteilt. Optional kann ein
+    Vorgang ausgenommen werden (z. B. der gerade neu zugewiesene selbst).
     """
-    auftraege = {a["id"]: a for a in auftraege_liste()}
-    auftrag = auftraege.get(auftrag_id)
-    if not auftrag:
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT id, stunden, start_datum, end_datum FROM vorgaenge "
+            "WHERE mitarbeiter_id = %s AND status = 'zugewiesen' "
+            "AND start_datum IS NOT NULL AND end_datum IS NOT NULL",
+            (mitarbeiter_id,),
+        )
+        vorgaenge = [dict(r) for r in cur.fetchall()]
+
+    # Feiertage über alle betroffenen Jahre sammeln
+    jahre = set()
+    for v in vorgaenge:
+        jahre.add(v["start_datum"].year)
+        jahre.add(v["end_datum"].year)
+    feiertage = {}
+    for j in jahre:
+        feiertage.update(bw_feiertage(j))
+
+    pro_tag = {}
+    for v in vorgaenge:
+        if ausser_vorgang_id is not None and v["id"] == ausser_vorgang_id:
+            continue
+        tage = _arbeitstage(v["start_datum"], v["end_datum"], feiertage)
+        if not tage:
+            continue
+        h = v["stunden"] / len(tage)
+        for d in tage:
+            pro_tag[d] = pro_tag.get(d, 0.0) + h
+    return pro_tag
+
+
+def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden):
+    """
+    Prüft, ob der Mitarbeiter im Zeitraum [start, ende] an Tagen über seine
+    effektive Tageskapazität käme, wenn 'zusatz_stunden' gleichmäßig auf die
+    Arbeitstage verteilt hinzukommen.
+
+    Rückgabe: Liste von (datum, geplante_stunden, kapazitaet) für Tage über Kapazität.
+    """
+    if not start or not ende or ende < start:
+        return []
+    feiertage = {}
+    for j in {start.year, ende.year}:
+        feiertage.update(bw_feiertage(j))
+    tage = _arbeitstage(start, ende, feiertage)
+    if not tage:
         return []
 
-    benoetigt = {s["id"]: s["min_level"] for s in auftrag["skills"]}
-    aufwand = auftrag["stunden"]
+    kapazitaet = mitarbeiter["tageskapazitaet"]
+    bestand = _verplante_stunden_pro_tag(mitarbeiter["id"])
+    zusatz_pro_tag = zusatz_stunden / len(tage)
+
+    konflikte = []
+    for d in tage:
+        geplant = bestand.get(d, 0.0) + zusatz_pro_tag
+        if kapazitaet > 0 and geplant > kapazitaet + 0.01:
+            konflikte.append((d, round(geplant, 1), round(kapazitaet, 1)))
+    return konflikte
+
+
+def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
+    # Vorgang samt Kontext holen
+    ziel = None
+    for a in auftraege_liste():
+        for v in a["vorgaenge"]:
+            if v["id"] == vorgang_id:
+                ziel = v
+                break
+        if ziel:
+            break
+    if not ziel:
+        return []
+
+    benoetigt = {s["id"]: s["min_level"] for s in ziel["skills"]}
+    aufwand = ziel["stunden"]
+    gruppe_id = ziel.get("gruppe_id")
+    start = ziel.get("start_datum")
+    ende = ziel.get("end_datum")
 
     kandidaten = []
     for m in mitarbeiter_liste():
+        # Strikte Gruppenfilterung: nur passende Gruppe
+        if gruppe_id is not None and m.get("gruppe_id") != gruppe_id:
+            continue
+
         skill_map = {s["id"]: s["level"] for s in m["skills"]}
-
-        erfuellt = all(
-            skill_map.get(sid, 0) >= minlvl for sid, minlvl in benoetigt.items()
-        )
-        if not erfuellt:
+        if not all(skill_map.get(sid, 0) >= lvl for sid, lvl in benoetigt.items()):
             continue
-
-        if m["frei"] < aufwand:
-            continue
+        frei = m["wochenstunden"] - m["verplant"]
+        # Hinweis: Die Wochensumme schließt NICHT mehr hart aus. Ob es im
+        # konkreten Zeitraum eng wird, prüft die Überbuchungs-Warnung unten.
 
         if benoetigt:
-            reserven = []
-            for sid, minlvl in benoetigt.items():
-                spielraum = (skill_map[sid] - minlvl) / 4.0
-                reserven.append(max(0.0, min(1.0, spielraum)))
+            reserven = [max(0.0, min(1.0, (skill_map[sid] - lvl) / 4.0))
+                        for sid, lvl in benoetigt.items()]
             score_skill = sum(reserven) / len(reserven)
         else:
             score_skill = 1.0
 
         if m["wochenstunden"] > 0:
-            rest_nach = (m["frei"] - aufwand) / m["wochenstunden"]
-            score_kapazitaet = max(0.0, min(1.0, rest_nach))
+            # Auf 0..1 begrenzt; bei Überbuchung fällt der Kapazitäts-Score auf 0,
+            # statt den Kandidaten ganz zu entfernen.
+            score_kap = max(0.0, min(1.0, (frei - aufwand) / m["wochenstunden"]))
+            score_ausg = max(0.0, min(1.0, 1.0 - m["verplant"] / m["wochenstunden"]))
         else:
-            score_kapazitaet = 0.0
+            score_kap = score_ausg = 0.0
 
-        if m["wochenstunden"] > 0:
-            auslastung = m["verplant"] / m["wochenstunden"]
-            score_ausgleich = max(0.0, min(1.0, 1.0 - auslastung))
-        else:
-            score_ausgleich = 0.0
+        score = (GEWICHT_SKILL * score_skill
+                 + GEWICHT_KAPAZITAET * score_kap
+                 + GEWICHT_AUSGLEICH * score_ausg)
 
-        score = (
-            GEWICHT_SKILL * score_skill
-            + GEWICHT_KAPAZITAET * score_kapazitaet
-            + GEWICHT_AUSGLEICH * score_ausgleich
-        )
+        # Zeitraumbezogene Überbuchung (nur Warnung, kein Ausschluss)
+        konflikte = _ueberbuchung_im_zeitraum(m, start, ende, aufwand)
 
-        kandidaten.append(
-            {
-                "mitarbeiter": m,
-                "score": round(score, 3),
-                "begruendung": {
-                    "Skill-Passung": round(score_skill, 2),
-                    "Kapazität": round(score_kapazitaet, 2),
-                    "Auslastungsausgleich": round(score_ausgleich, 2),
-                },
-                "frei_nach": round(m["frei"] - aufwand, 1),
-            }
-        )
+        kandidaten.append({
+            "mitarbeiter": m,
+            "score": round(score, 3),
+            "begruendung": {
+                "Skill-Passung": round(score_skill, 2),
+                "Kapazität": round(score_kap, 2),
+                "Auslastungsausgleich": round(score_ausg, 2),
+            },
+            "frei_nach": round(frei - aufwand, 1),
+            "ueberbuchung": konflikte,  # Liste (datum, geplant_h, kapazitaet_h)
+        })
 
     kandidaten.sort(key=lambda k: k["score"], reverse=True)
     return kandidaten[:top_n]
+
+
+# --------------------------------------------------------------------------
+# Kalender / Feiertage / Auslastung
+# --------------------------------------------------------------------------
+
+def bw_feiertage(jahr):
+    """Dict {date: name} der Feiertage in Baden-Württemberg."""
+    if _holidays_lib is None:
+        return {}
+    return dict(_holidays_lib.Germany(subdiv="BW", years=jahr))
+
+
+def _arbeitstage(start, ende, feiertage):
+    """Liste der Arbeitstage (Mo–Fr, ohne Feiertage) zwischen start und ende inkl."""
+    if not start or not ende or ende < start:
+        return []
+    tage = []
+    d = start
+    while d <= ende:
+        if d.weekday() < 5 and d not in feiertage:
+            tage.append(d)
+        d += timedelta(days=1)
+    return tage
+
+
+def tagesauslastung(jahr, monat):
+    """
+    Berechnet je Mitarbeiter und Tag die geplanten Stunden im gegebenen Monat.
+
+    Rückgabe:
+      {
+        "feiertage": {date: name},
+        "mitarbeiter": [
+            {"id", "name", "tageskapazitaet",
+             "tage": {date: {"stunden": float, "vorgaenge": [..], "deadlines": [..]}}}
+        ]
+      }
+    Die Stunden eines Vorgangs werden gleichmäßig über seine Arbeitstage verteilt.
+    """
+    erster = date(jahr, monat, 1)
+    if monat == 12:
+        letzter = date(jahr + 1, 1, 1) - timedelta(days=1)
+    else:
+        letzter = date(jahr, monat + 1, 1) - timedelta(days=1)
+
+    feiertage = bw_feiertage(jahr)
+
+    # Alle zugewiesenen Vorgänge mit Datum holen
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT v.id, v.stunden, v.start_datum, v.end_datum, v.mitarbeiter_id, "
+            "       t.name AS typ_name, a.titel AS auftrag_titel, a.auftragsnummer, "
+            "       a.liefertermin "
+            "FROM vorgaenge v "
+            "LEFT JOIN vorgangstypen t ON t.id = v.typ_id "
+            "JOIN auftraege a ON a.id = v.auftrag_id "
+            "WHERE v.status = 'zugewiesen' AND v.mitarbeiter_id IS NOT NULL "
+            "AND v.start_datum IS NOT NULL AND v.end_datum IS NOT NULL"
+        )
+        vorgaenge = [dict(r) for r in cur.fetchall()]
+
+    ma = mitarbeiter_liste()
+    ergebnis = {m["id"]: {
+        "id": m["id"], "name": m["name"],
+        "tageskapazitaet": m["tageskapazitaet"], "tage": {}
+    } for m in ma}
+
+    for v in vorgaenge:
+        mid = v["mitarbeiter_id"]
+        if mid not in ergebnis:
+            continue
+        arbeitstage = _arbeitstage(v["start_datum"], v["end_datum"], feiertage)
+        if not arbeitstage:
+            continue
+        h_pro_tag = v["stunden"] / len(arbeitstage)
+        for d in arbeitstage:
+            if d < erster or d > letzter:
+                continue
+            slot = ergebnis[mid]["tage"].setdefault(
+                d, {"stunden": 0.0, "vorgaenge": [], "deadlines": []}
+            )
+            slot["stunden"] += h_pro_tag
+            label = v["typ_name"] or "Vorgang"
+            slot["vorgaenge"].append(f"{v['auftrag_titel']} – {label}")
+        # Deadline (Vorgangsende) im Monat markieren
+        if erster <= v["end_datum"] <= letzter and v["end_datum"] in ergebnis[mid]["tage"]:
+            ergebnis[mid]["tage"][v["end_datum"]]["deadlines"].append(
+                f"Ende: {v['auftrag_titel']} – {v['typ_name'] or 'Vorgang'}"
+            )
+
+    return {
+        "feiertage": {d: n for d, n in feiertage.items() if erster <= d <= letzter},
+        "mitarbeiter": list(ergebnis.values()),
+        "erster": erster,
+        "letzter": letzter,
+    }
