@@ -403,6 +403,36 @@ def effektive_tageskapazitaet(mitarbeiter, datum, ausnahmen=None):
     return brutto * (mitarbeiter["effektivitaet"] / 100.0)
 
 
+def verteile_stunden(mitarbeiter, tage, gesamt_stunden, ausnahmen=None):
+    """
+    Verteilt 'gesamt_stunden' auf die gegebenen Arbeitstage PROPORTIONAL zur
+    effektiven Tageskapazität des Mitarbeiters. Ein Tag mit doppelter Kapazität
+    (z. B. Überstunden) bekommt doppelt so viele Stunden wie ein normaler Tag.
+
+    Beispiel: 88 h auf 10 Tage, davon 2 Tage à 12 h Kapazität und 8 Tage à 8 h:
+    -> die 12-h-Tage erhalten je 12 h, die 8-h-Tage je 8 h.
+
+    Fällt die Gesamtkapazität auf 0 (z. B. alles Urlaub), wird als Rückfall
+    gleichmäßig verteilt, damit keine Stunden verloren gehen.
+
+    Rückgabe: {datum: stunden}
+    """
+    if not tage:
+        return {}
+    if ausnahmen is None:
+        ausnahmen = _ausnahmen_map(mitarbeiter["id"])
+
+    kapazitaeten = {d: effektive_tageskapazitaet(mitarbeiter, d, ausnahmen) for d in tage}
+    summe = sum(kapazitaeten.values())
+
+    if summe <= 0:
+        # kein Kapazitätsprofil -> gleichmäßig (Rückfalllösung)
+        gleich = gesamt_stunden / len(tage)
+        return {d: gleich for d in tage}
+
+    return {d: gesamt_stunden * (kapazitaeten[d] / summe) for d in tage}
+
+
 # --------------------------------------------------------------------------
 # Aufträge
 # --------------------------------------------------------------------------
@@ -597,8 +627,8 @@ GEWICHT_AUSGLEICH = 0.2
 def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
     """
     Liefert {date: stunden} der bereits zugewiesenen Vorgänge eines Mitarbeiters,
-    gleichmäßig über die jeweiligen Arbeitstage verteilt. Optional kann ein
-    Vorgang ausgenommen werden (z. B. der gerade neu zugewiesene selbst).
+    proportional zur Tageskapazität über die Arbeitstage verteilt. Optional kann
+    ein Vorgang ausgenommen werden.
     """
     with get_cursor() as cur:
         cur.execute(
@@ -608,6 +638,12 @@ def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
             (mitarbeiter_id,),
         )
         vorgaenge = [dict(r) for r in cur.fetchall()]
+
+    # Mitarbeiterobjekt + Ausnahmen für die kapazitätsproportionale Verteilung
+    m = next((x for x in mitarbeiter_liste() if x["id"] == mitarbeiter_id), None)
+    if m is None:
+        return {}
+    ausnahmen = _ausnahmen_map(mitarbeiter_id)
 
     jahre = set()
     for v in vorgaenge:
@@ -624,16 +660,15 @@ def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
         tage = _arbeitstage(v["start_datum"], v["end_datum"], feiertage)
         if not tage:
             continue
-        h = v["stunden"] / len(tage)
-        for d in tage:
+        for d, h in verteile_stunden(m, tage, v["stunden"], ausnahmen).items():
             pro_tag[d] = pro_tag.get(d, 0.0) + h
     return pro_tag
 
 
 def _bestand_alle_mitarbeiter():
     """
-    {mitarbeiter_id: {date: stunden}} der zugewiesenen Vorgänge ALLER Mitarbeiter
-    in einer einzigen Abfrage. Vermeidet eine Abfrage pro Kandidat.
+    {mitarbeiter_id: {date: stunden}} der zugewiesenen Vorgänge ALLER Mitarbeiter,
+    kapazitätsproportional verteilt. Wenige Sammelabfragen statt einer pro Kandidat.
     """
     with get_cursor() as cur:
         cur.execute(
@@ -642,6 +677,9 @@ def _bestand_alle_mitarbeiter():
             "AND start_datum IS NOT NULL AND end_datum IS NOT NULL"
         )
         vorgaenge = [dict(r) for r in cur.fetchall()]
+
+    ma_by_id = {m["id"]: m for m in mitarbeiter_liste()}
+    alle_ausnahmen = _ausnahmen_alle_mitarbeiter()
 
     jahre = set()
     for v in vorgaenge:
@@ -653,12 +691,15 @@ def _bestand_alle_mitarbeiter():
 
     result = {}
     for v in vorgaenge:
+        m = ma_by_id.get(v["mitarbeiter_id"])
+        if m is None:
+            continue
         tage = _arbeitstage(v["start_datum"], v["end_datum"], feiertage)
         if not tage:
             continue
-        h = v["stunden"] / len(tage)
+        ausnahmen = alle_ausnahmen.get(v["mitarbeiter_id"], {})
         pro_tag = result.setdefault(v["mitarbeiter_id"], {})
-        for d in tage:
+        for d, h in verteile_stunden(m, tage, v["stunden"], ausnahmen).items():
             pro_tag[d] = pro_tag.get(d, 0.0) + h
     return result
 
@@ -698,12 +739,14 @@ def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden,
         ausnahmen = _ausnahmen_map(mitarbeiter["id"])
     if bestand is None:
         bestand = _verplante_stunden_pro_tag(mitarbeiter["id"])
-    zusatz_pro_tag = zusatz_stunden / len(tage)
+
+    # Neuen Vorgang ebenfalls kapazitätsproportional verteilen
+    zusatz_pro_tag = verteile_stunden(mitarbeiter, tage, zusatz_stunden, ausnahmen)
 
     konflikte = []
     for d in tage:
         kapazitaet = effektive_tageskapazitaet(mitarbeiter, d, ausnahmen)
-        geplant = bestand.get(d, 0.0) + zusatz_pro_tag
+        geplant = bestand.get(d, 0.0) + zusatz_pro_tag.get(d, 0.0)
         if geplant > kapazitaet + 0.01:
             konflikte.append((d, round(geplant, 1), round(kapazitaet, 1)))
     return konflikte
@@ -884,17 +927,24 @@ def tagesauslastung(jahr, monat):
         mid = v["mitarbeiter_id"]
         if mid not in ergebnis:
             continue
-        arbeitstage = _arbeitstage(v["start_datum"], v["end_datum"], feiertage)
+        # Feiertage über die gesamte Vorgangsdauer (kann über Jahreswechsel gehen)
+        ft = {}
+        for j in {v["start_datum"].year, v["end_datum"].year}:
+            ft.update(bw_feiertage(j))
+        arbeitstage = _arbeitstage(v["start_datum"], v["end_datum"], ft)
         if not arbeitstage:
             continue
-        h_pro_tag = v["stunden"] / len(arbeitstage)
-        for d in arbeitstage:
+        m_obj = ergebnis[mid]["_obj"]
+        m_ausn = ergebnis[mid]["_ausnahmen"]
+        # kapazitätsproportional über ALLE Arbeitstage des Vorgangs verteilen
+        verteilung = verteile_stunden(m_obj, arbeitstage, v["stunden"], m_ausn)
+        for d, h in verteilung.items():
             if d < erster or d > letzter:
                 continue
             slot = ergebnis[mid]["tage"].setdefault(
                 d, {"stunden": 0.0, "vorgaenge": [], "deadlines": []}
             )
-            slot["stunden"] += h_pro_tag
+            slot["stunden"] += h
             label = v["typ_name"] or "Vorgang"
             slot["vorgaenge"].append(f"{v['auftrag_titel']} – {label}")
         # Deadline (Vorgangsende) im Monat markieren
