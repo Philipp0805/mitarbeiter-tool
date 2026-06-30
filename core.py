@@ -309,21 +309,32 @@ def mitarbeiter_liste():
             "ORDER BY m.name"
         )
         rows = [dict(r) for r in cur.fetchall()]
+        if not rows:
+            return rows
+
+        # Skills für ALLE Mitarbeiter in einer Abfrage (statt einer pro Person)
+        cur.execute(
+            "SELECT ms.mitarbeiter_id, s.id, s.name, ms.level "
+            "FROM mitarbeiter_skills ms JOIN skills s ON s.id = ms.skill_id "
+            "ORDER BY s.name"
+        )
+        skills_by_ma = {}
+        for s in cur.fetchall():
+            skills_by_ma.setdefault(s["mitarbeiter_id"], []).append(
+                {"id": s["id"], "name": s["name"], "level": s["level"]}
+            )
+
+        # Verplante Stunden für ALLE Mitarbeiter in einer Abfrage
+        cur.execute(
+            "SELECT mitarbeiter_id, COALESCE(SUM(stunden),0) AS s "
+            "FROM vorgaenge WHERE status = 'zugewiesen' AND mitarbeiter_id IS NOT NULL "
+            "GROUP BY mitarbeiter_id"
+        )
+        verplant_by_ma = {r["mitarbeiter_id"]: r["s"] for r in cur.fetchall()}
+
         for r in rows:
-            cur.execute(
-                "SELECT s.id, s.name, ms.level "
-                "FROM mitarbeiter_skills ms JOIN skills s ON s.id = ms.skill_id "
-                "WHERE ms.mitarbeiter_id = %s ORDER BY s.name",
-                (r["id"],),
-            )
-            r["skills"] = [dict(s) for s in cur.fetchall()]
-            cur.execute(
-                "SELECT COALESCE(SUM(stunden),0) AS s FROM vorgaenge "
-                "WHERE mitarbeiter_id = %s AND status = 'zugewiesen'",
-                (r["id"],),
-            )
-            r["verplant"] = cur.fetchone()["s"]
-            # effektive Standard-Tageskapazitaet in Stunden (5-Tage-Woche)
+            r["skills"] = skills_by_ma.get(r["id"], [])
+            r["verplant"] = verplant_by_ma.get(r["id"], 0)
             r["tageskapazitaet"] = r["wochenstunden"] / 5.0 * (r["effektivitaet"] / 100.0)
         return rows
 
@@ -598,7 +609,6 @@ def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
         )
         vorgaenge = [dict(r) for r in cur.fetchall()]
 
-    # Feiertage über alle betroffenen Jahre sammeln
     jahre = set()
     for v in vorgaenge:
         jahre.add(v["start_datum"].year)
@@ -620,11 +630,58 @@ def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
     return pro_tag
 
 
-def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden):
+def _bestand_alle_mitarbeiter():
+    """
+    {mitarbeiter_id: {date: stunden}} der zugewiesenen Vorgänge ALLER Mitarbeiter
+    in einer einzigen Abfrage. Vermeidet eine Abfrage pro Kandidat.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT mitarbeiter_id, stunden, start_datum, end_datum FROM vorgaenge "
+            "WHERE status = 'zugewiesen' AND mitarbeiter_id IS NOT NULL "
+            "AND start_datum IS NOT NULL AND end_datum IS NOT NULL"
+        )
+        vorgaenge = [dict(r) for r in cur.fetchall()]
+
+    jahre = set()
+    for v in vorgaenge:
+        jahre.add(v["start_datum"].year)
+        jahre.add(v["end_datum"].year)
+    feiertage = {}
+    for j in jahre:
+        feiertage.update(bw_feiertage(j))
+
+    result = {}
+    for v in vorgaenge:
+        tage = _arbeitstage(v["start_datum"], v["end_datum"], feiertage)
+        if not tage:
+            continue
+        h = v["stunden"] / len(tage)
+        pro_tag = result.setdefault(v["mitarbeiter_id"], {})
+        for d in tage:
+            pro_tag[d] = pro_tag.get(d, 0.0) + h
+    return result
+
+
+def _ausnahmen_alle_mitarbeiter():
+    """{mitarbeiter_id: {date: brutto_stunden}} aller Ausnahmen in einer Abfrage."""
+    with get_cursor() as cur:
+        cur.execute("SELECT mitarbeiter_id, datum, brutto_stunden FROM tagesarbeitszeit")
+        result = {}
+        for r in cur.fetchall():
+            result.setdefault(r["mitarbeiter_id"], {})[r["datum"]] = r["brutto_stunden"]
+        return result
+
+
+def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden,
+                              bestand=None, ausnahmen=None):
     """
     Prüft, ob der Mitarbeiter im Zeitraum [start, ende] an Tagen über seine
     effektive Tageskapazität käme, wenn 'zusatz_stunden' gleichmäßig auf die
     Arbeitstage verteilt hinzukommen.
+
+    bestand/ausnahmen können vorab geladen übergeben werden (Performance);
+    sonst werden sie für diesen einen Mitarbeiter nachgeladen.
 
     Rückgabe: Liste von (datum, geplante_stunden, kapazitaet) für Tage über Kapazität.
     """
@@ -637,14 +694,14 @@ def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden):
     if not tage:
         return []
 
-    kapazitaet_standard = mitarbeiter["tageskapazitaet"]
-    ausnahmen = _ausnahmen_map(mitarbeiter["id"])
-    bestand = _verplante_stunden_pro_tag(mitarbeiter["id"])
+    if ausnahmen is None:
+        ausnahmen = _ausnahmen_map(mitarbeiter["id"])
+    if bestand is None:
+        bestand = _verplante_stunden_pro_tag(mitarbeiter["id"])
     zusatz_pro_tag = zusatz_stunden / len(tage)
 
     konflikte = []
     for d in tage:
-        # Tagesgenaue Kapazität: Ausnahme überschreibt den Standard
         kapazitaet = effektive_tageskapazitaet(mitarbeiter, d, ausnahmen)
         geplant = bestand.get(d, 0.0) + zusatz_pro_tag
         if geplant > kapazitaet + 0.01:
@@ -652,16 +709,35 @@ def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden):
     return konflikte
 
 
+def _vorgang_by_id(vorgang_id):
+    """Lädt genau einen Vorgang samt Kontext und Skills (eine Abfrage + eine für Skills)."""
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT v.*, t.name AS typ_name, t.gruppe_id, g.name AS gruppe_name, "
+            "       a.titel AS auftrag_titel, a.auftragsnummer, a.kunde, a.liefertermin "
+            "FROM vorgaenge v "
+            "LEFT JOIN vorgangstypen t ON t.id = v.typ_id "
+            "LEFT JOIN gruppen g ON g.id = t.gruppe_id "
+            "JOIN auftraege a ON a.id = v.auftrag_id "
+            "WHERE v.id = %s",
+            (vorgang_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        ziel = dict(row)
+        cur.execute(
+            "SELECT s.id, s.name, vs.min_level "
+            "FROM vorgang_skills vs JOIN skills s ON s.id = vs.skill_id "
+            "WHERE vs.vorgang_id = %s ORDER BY s.name",
+            (vorgang_id,),
+        )
+        ziel["skills"] = [dict(s) for s in cur.fetchall()]
+        return ziel
+
+
 def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
-    # Vorgang samt Kontext holen
-    ziel = None
-    for a in auftraege_liste():
-        for v in a["vorgaenge"]:
-            if v["id"] == vorgang_id:
-                ziel = v
-                break
-        if ziel:
-            break
+    ziel = _vorgang_by_id(vorgang_id)
     if not ziel:
         return []
 
@@ -670,6 +746,10 @@ def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
     gruppe_id = ziel.get("gruppe_id")
     start = ziel.get("start_datum")
     ende = ziel.get("end_datum")
+
+    # Einmal gebündelt für ALLE Mitarbeiter laden (statt pro Kandidat)
+    alle_bestaende = _bestand_alle_mitarbeiter()
+    alle_ausnahmen = _ausnahmen_alle_mitarbeiter()
 
     kandidaten = []
     for m in mitarbeiter_liste():
@@ -703,8 +783,12 @@ def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
                  + GEWICHT_KAPAZITAET * score_kap
                  + GEWICHT_AUSGLEICH * score_ausg)
 
-        # Zeitraumbezogene Überbuchung (nur Warnung, kein Ausschluss)
-        konflikte = _ueberbuchung_im_zeitraum(m, start, ende, aufwand)
+        # Zeitraumbezogene Überbuchung (nur Warnung) – mit vorab geladenen Daten
+        konflikte = _ueberbuchung_im_zeitraum(
+            m, start, ende, aufwand,
+            bestand=alle_bestaende.get(m["id"], {}),
+            ausnahmen=alle_ausnahmen.get(m["id"], {}),
+        )
 
         kandidaten.append({
             "mitarbeiter": m,
@@ -715,7 +799,7 @@ def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
                 "Auslastungsausgleich": round(score_ausg, 2),
             },
             "frei_nach": round(frei - aufwand, 1),
-            "ueberbuchung": konflikte,  # Liste (datum, geplant_h, kapazitaet_h)
+            "ueberbuchung": konflikte,
         })
 
     kandidaten.sort(key=lambda k: k["score"], reverse=True)
@@ -726,11 +810,16 @@ def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
 # Kalender / Feiertage / Auslastung
 # --------------------------------------------------------------------------
 
+_feiertage_cache = {}
+
+
 def bw_feiertage(jahr):
-    """Dict {date: name} der Feiertage in Baden-Württemberg."""
+    """Dict {date: name} der Feiertage in Baden-Württemberg (pro Jahr gecacht)."""
     if _holidays_lib is None:
         return {}
-    return dict(_holidays_lib.Germany(subdiv="BW", years=jahr))
+    if jahr not in _feiertage_cache:
+        _feiertage_cache[jahr] = dict(_holidays_lib.Germany(subdiv="BW", years=jahr))
+    return _feiertage_cache[jahr]
 
 
 def _arbeitstage(start, ende, feiertage):
