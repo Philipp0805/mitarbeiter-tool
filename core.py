@@ -12,6 +12,7 @@ from datetime import datetime
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import streamlit as st
 
 
@@ -21,17 +22,37 @@ def _db_url():
 
 
 # --------------------------------------------------------------------------
+# Verbindungs-Pool
+#
+# Frueher wurde bei JEDEM Klick eine neue Verbindung ueber das Internet zur
+# Datenbank aufgebaut und wieder geschlossen – das kostet jedes Mal mehrere
+# Sekunden. Stattdessen halten wir jetzt einen kleinen Pool offener
+# Verbindungen vor und verwenden sie wieder. @st.cache_resource sorgt dafuer,
+# dass der Pool nur einmal pro App-Prozess erstellt wird.
+# --------------------------------------------------------------------------
+
+@st.cache_resource
+def _pool():
+    return psycopg2.pool.SimpleConnectionPool(1, 5, dsn=_db_url())
+
+
+# --------------------------------------------------------------------------
 # Datenbank-Setup
 # --------------------------------------------------------------------------
 
 @contextmanager
 def get_conn():
-    conn = psycopg2.connect(_db_url())
+    pool = _pool()
+    conn = pool.getconn()
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        conn.close()
+        # Verbindung NICHT schliessen, sondern in den Pool zuruecklegen.
+        pool.putconn(conn)
 
 
 @contextmanager
