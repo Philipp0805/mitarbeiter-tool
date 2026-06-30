@@ -130,6 +130,15 @@ def init_db():
                 min_level    INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (vorgang_id, skill_id)
             );
+
+            -- Tagesgenaue Brutto-Arbeitszeit (Ausnahme vom Standard Wochenstunden/5).
+            -- Effektivität wird auf diesen Wert noch angewandt.
+            CREATE TABLE IF NOT EXISTS tagesarbeitszeit (
+                mitarbeiter_id  INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
+                datum           DATE NOT NULL,
+                brutto_stunden  REAL NOT NULL,
+                PRIMARY KEY (mitarbeiter_id, datum)
+            );
             """
         )
         conn.commit()
@@ -314,9 +323,73 @@ def mitarbeiter_liste():
                 (r["id"],),
             )
             r["verplant"] = cur.fetchone()["s"]
-            # effektive Tageskapazitaet in Stunden (5-Tage-Woche)
+            # effektive Standard-Tageskapazitaet in Stunden (5-Tage-Woche)
             r["tageskapazitaet"] = r["wochenstunden"] / 5.0 * (r["effektivitaet"] / 100.0)
         return rows
+
+
+# --------------------------------------------------------------------------
+# Tagesgenaue Arbeitszeit (Ausnahmen vom Standard)
+# --------------------------------------------------------------------------
+
+def tagesarbeitszeit_setzen(mitarbeiter_id, datum, brutto_stunden):
+    """Legt eine Ausnahme an oder überschreibt sie (Brutto-Stunden für den Tag)."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tagesarbeitszeit (mitarbeiter_id, datum, brutto_stunden) "
+            "VALUES (%s, %s, %s) "
+            "ON CONFLICT (mitarbeiter_id, datum) "
+            "DO UPDATE SET brutto_stunden = EXCLUDED.brutto_stunden",
+            (mitarbeiter_id, datum, float(brutto_stunden)),
+        )
+        conn.commit()
+        cur.close()
+
+
+def tagesarbeitszeit_loeschen(mitarbeiter_id, datum):
+    """Entfernt die Ausnahme -> der Standard gilt wieder."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM tagesarbeitszeit WHERE mitarbeiter_id = %s AND datum = %s",
+            (mitarbeiter_id, datum),
+        )
+        conn.commit()
+        cur.close()
+
+
+def tagesarbeitszeit_liste(mitarbeiter_id):
+    """Alle Ausnahmen eines Mitarbeiters, nach Datum sortiert."""
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT datum, brutto_stunden FROM tagesarbeitszeit "
+            "WHERE mitarbeiter_id = %s ORDER BY datum",
+            (mitarbeiter_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _ausnahmen_map(mitarbeiter_id):
+    """{datum: brutto_stunden} der Ausnahmen eines Mitarbeiters."""
+    return {r["datum"]: r["brutto_stunden"] for r in tagesarbeitszeit_liste(mitarbeiter_id)}
+
+
+def effektive_tageskapazitaet(mitarbeiter, datum, ausnahmen=None):
+    """
+    Effektive (auftragsbezogene) Kapazität eines Mitarbeiters an einem Tag.
+
+    Liegt für den Tag eine Brutto-Ausnahme vor, wird sie genutzt, sonst der
+    Standard (Wochenstunden/5). Auf den Brutto-Wert wird die Effektivität
+    angewandt.
+    """
+    if ausnahmen is None:
+        ausnahmen = _ausnahmen_map(mitarbeiter["id"])
+    if datum in ausnahmen:
+        brutto = ausnahmen[datum]
+    else:
+        brutto = mitarbeiter["wochenstunden"] / 5.0
+    return brutto * (mitarbeiter["effektivitaet"] / 100.0)
 
 
 # --------------------------------------------------------------------------
@@ -564,14 +637,17 @@ def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden):
     if not tage:
         return []
 
-    kapazitaet = mitarbeiter["tageskapazitaet"]
+    kapazitaet_standard = mitarbeiter["tageskapazitaet"]
+    ausnahmen = _ausnahmen_map(mitarbeiter["id"])
     bestand = _verplante_stunden_pro_tag(mitarbeiter["id"])
     zusatz_pro_tag = zusatz_stunden / len(tage)
 
     konflikte = []
     for d in tage:
+        # Tagesgenaue Kapazität: Ausnahme überschreibt den Standard
+        kapazitaet = effektive_tageskapazitaet(mitarbeiter, d, ausnahmen)
         geplant = bestand.get(d, 0.0) + zusatz_pro_tag
-        if kapazitaet > 0 and geplant > kapazitaet + 0.01:
+        if geplant > kapazitaet + 0.01:
             konflikte.append((d, round(geplant, 1), round(kapazitaet, 1)))
     return konflikte
 
@@ -709,7 +785,10 @@ def tagesauslastung(jahr, monat):
     ma = mitarbeiter_liste()
     ergebnis = {m["id"]: {
         "id": m["id"], "name": m["name"],
-        "tageskapazitaet": m["tageskapazitaet"], "tage": {}
+        "tageskapazitaet": m["tageskapazitaet"],  # Standard (Fallback in der Anzeige)
+        "_obj": m,
+        "_ausnahmen": _ausnahmen_map(m["id"]),
+        "tage": {}
     } for m in ma}
 
     for v in vorgaenge:
@@ -734,6 +813,26 @@ def tagesauslastung(jahr, monat):
             ergebnis[mid]["tage"][v["end_datum"]]["deadlines"].append(
                 f"Ende: {v['auftrag_titel']} – {v['typ_name'] or 'Vorgang'}"
             )
+
+    # Tagesgenaue Kapazität ergänzen – für alle Werktage im Monat, damit auch
+    # Ausnahmen ohne geplante Vorgänge (z. B. Urlaub = 0 h) sichtbar werden.
+    d = erster
+    while d <= letzter:
+        if d.weekday() < 5 and d not in feiertage:
+            for eintrag in ergebnis.values():
+                kap = effektive_tageskapazitaet(eintrag["_obj"], d, eintrag["_ausnahmen"])
+                slot = eintrag["tage"].setdefault(
+                    d, {"stunden": 0.0, "vorgaenge": [], "deadlines": []}
+                )
+                slot["kapazitaet"] = kap
+                # markieren, ob für den Tag eine Ausnahme hinterlegt ist
+                slot["ausnahme"] = d in eintrag["_ausnahmen"]
+        d += timedelta(days=1)
+
+    # interne Hilfsfelder entfernen
+    for eintrag in ergebnis.values():
+        eintrag.pop("_obj", None)
+        eintrag.pop("_ausnahmen", None)
 
     return {
         "feiertage": {d: n for d, n in feiertage.items() if erster <= d <= letzter},
