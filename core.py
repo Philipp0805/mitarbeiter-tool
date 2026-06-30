@@ -167,6 +167,30 @@ def mitarbeiter_loeschen(mid):
         cur.close()
 
 
+def mitarbeiter_aktualisieren(mid, name, wochenstunden, skill_level_map):
+    """
+    Ueberschreibt Name, Wochenstunden und Skills eines Mitarbeiters.
+    Die Skills werden komplett neu gesetzt (alte raus, neue rein).
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE mitarbeiter SET name = %s, wochenstunden = %s WHERE id = %s",
+            (name.strip(), float(wochenstunden), mid),
+        )
+        cur.execute(
+            "DELETE FROM mitarbeiter_skills WHERE mitarbeiter_id = %s", (mid,)
+        )
+        for skill_id, level in skill_level_map.items():
+            cur.execute(
+                "INSERT INTO mitarbeiter_skills (mitarbeiter_id, skill_id, level) "
+                "VALUES (%s, %s, %s)",
+                (mid, skill_id, int(level)),
+            )
+        conn.commit()
+        cur.close()
+
+
 def mitarbeiter_liste():
     with get_cursor() as cur:
         cur.execute("SELECT * FROM mitarbeiter ORDER BY name")
