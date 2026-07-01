@@ -110,6 +110,7 @@ def init_db():
                 kunde           TEXT,
                 liefertermin    DATE,
                 kommentar       TEXT,
+                prioritaet      TEXT NOT NULL DEFAULT 'Normal',  -- Hoch | Normal | Niedrig
                 erstellt_am     TEXT NOT NULL
             );
 
@@ -118,6 +119,7 @@ def init_db():
                 auftrag_id      INTEGER NOT NULL REFERENCES auftraege(id) ON DELETE CASCADE,
                 typ_id          INTEGER REFERENCES vorgangstypen(id) ON DELETE SET NULL,
                 stunden         REAL NOT NULL DEFAULT 0,
+                anteil_prozent  REAL NOT NULL DEFAULT 100,  -- Richtwert: max. % der Tageskapazität
                 start_datum     DATE,
                 end_datum       DATE,
                 mitarbeiter_id  INTEGER REFERENCES mitarbeiter(id) ON DELETE SET NULL,
@@ -132,6 +134,7 @@ def init_db():
             );
 
             -- Tagesgenaue Brutto-Arbeitszeit (Ausnahme vom Standard Wochenstunden/5).
+            -- Wird jetzt nur noch für MEHRARBEIT/Überstunden genutzt.
             -- Effektivität wird auf diesen Wert noch angewandt.
             CREATE TABLE IF NOT EXISTS tagesarbeitszeit (
                 mitarbeiter_id  INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
@@ -139,7 +142,29 @@ def init_db():
                 brutto_stunden  REAL NOT NULL,
                 PRIMARY KEY (mitarbeiter_id, datum)
             );
+
+            -- Abwesenheitskategorien (Urlaub, Krank, ...), erweiterbar.
+            CREATE TABLE IF NOT EXISTS abwesenheitskategorien (
+                id    SERIAL PRIMARY KEY,
+                name  TEXT NOT NULL UNIQUE
+            );
+
+            -- Abwesenheiten: reduzieren die verfügbare Brutto-Zeit eines Tages.
+            CREATE TABLE IF NOT EXISTS abwesenheiten (
+                id              SERIAL PRIMARY KEY,
+                mitarbeiter_id  INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
+                datum           DATE NOT NULL,
+                stunden         REAL NOT NULL,
+                kategorie_id    INTEGER REFERENCES abwesenheitskategorien(id) ON DELETE SET NULL
+            );
             """
+        )
+        # Migrationen für bereits bestehende Datenbanken (Spalten nachrüsten)
+        cur.execute(
+            "ALTER TABLE vorgaenge ADD COLUMN IF NOT EXISTS anteil_prozent REAL NOT NULL DEFAULT 100"
+        )
+        cur.execute(
+            "ALTER TABLE auftraege ADD COLUMN IF NOT EXISTS prioritaet TEXT NOT NULL DEFAULT 'Normal'"
         )
         conn.commit()
         cur.close()
@@ -147,7 +172,11 @@ def init_db():
 
 
 def _vorbelegung():
-    """Legt Standard-Gruppen und -Vorgangstypen an, falls noch keine da sind."""
+    """Legt Standard-Gruppen, -Vorgangstypen und Abwesenheitskategorien an."""
+    # Abwesenheitskategorien (unabhängig von den Gruppen vorbelegen)
+    if not abwesenheitskategorien_liste():
+        for k in ["Urlaub", "Gleitzeit", "Berufsschule", "Krank", "Kurzarbeit"]:
+            abwesenheitskategorie_anlegen(k)
     if gruppen_liste():
         return
     for g in ["Konstruktion", "Produktion"]:
@@ -381,38 +410,159 @@ def tagesarbeitszeit_liste(mitarbeiter_id):
         return [dict(r) for r in cur.fetchall()]
 
 
+# --------------------------------------------------------------------------
+# Abwesenheitskategorien
+# --------------------------------------------------------------------------
+
+def abwesenheitskategorie_anlegen(name):
+    name = name.strip()
+    if not name:
+        return
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO abwesenheitskategorien (name) VALUES (%s) "
+            "ON CONFLICT (name) DO NOTHING",
+            (name,),
+        )
+        conn.commit()
+        cur.close()
+
+
+def abwesenheitskategorie_loeschen(kid):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM abwesenheitskategorien WHERE id = %s", (kid,))
+        conn.commit()
+        cur.close()
+
+
+def abwesenheitskategorien_liste():
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM abwesenheitskategorien ORDER BY name")
+        return [dict(r) for r in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------
+# Abwesenheiten
+# --------------------------------------------------------------------------
+
+def abwesenheit_setzen(mitarbeiter_id, datum, stunden, kategorie_id):
+    """
+    Setzt/aktualisiert die Abwesenheit eines Mitarbeiters an einem Tag für eine
+    Kategorie. Mehrere Kategorien am selben Tag sind möglich (z. B. halb Urlaub,
+    halb Berufsschule). stunden <= 0 entfernt den Eintrag.
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # Bestehenden Eintrag für (Mitarbeiter, Tag, Kategorie) ersetzen
+        cur.execute(
+            "DELETE FROM abwesenheiten WHERE mitarbeiter_id = %s AND datum = %s "
+            "AND kategorie_id IS NOT DISTINCT FROM %s",
+            (mitarbeiter_id, datum, kategorie_id),
+        )
+        if stunden and stunden > 0:
+            cur.execute(
+                "INSERT INTO abwesenheiten (mitarbeiter_id, datum, stunden, kategorie_id) "
+                "VALUES (%s, %s, %s, %s)",
+                (mitarbeiter_id, datum, float(stunden), kategorie_id),
+            )
+        conn.commit()
+        cur.close()
+
+
+def abwesenheit_loeschen(abw_id):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM abwesenheiten WHERE id = %s", (abw_id,))
+        conn.commit()
+        cur.close()
+
+
+def abwesenheiten_liste(mitarbeiter_id=None):
+    """Abwesenheiten (optional gefiltert nach Mitarbeiter), mit Kategoriename."""
+    with get_cursor() as cur:
+        if mitarbeiter_id is not None:
+            cur.execute(
+                "SELECT a.*, k.name AS kategorie_name, m.name AS mitarbeiter_name "
+                "FROM abwesenheiten a "
+                "LEFT JOIN abwesenheitskategorien k ON k.id = a.kategorie_id "
+                "JOIN mitarbeiter m ON m.id = a.mitarbeiter_id "
+                "WHERE a.mitarbeiter_id = %s ORDER BY a.datum",
+                (mitarbeiter_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT a.*, k.name AS kategorie_name, m.name AS mitarbeiter_name "
+                "FROM abwesenheiten a "
+                "LEFT JOIN abwesenheitskategorien k ON k.id = a.kategorie_id "
+                "JOIN mitarbeiter m ON m.id = a.mitarbeiter_id "
+                "ORDER BY a.datum"
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _abwesenheit_alle_mitarbeiter():
+    """{mitarbeiter_id: {datum: summe_stunden}} aller Abwesenheiten in einer Abfrage."""
+    with get_cursor() as cur:
+        cur.execute("SELECT mitarbeiter_id, datum, stunden FROM abwesenheiten")
+        result = {}
+        for r in cur.fetchall():
+            tag = result.setdefault(r["mitarbeiter_id"], {})
+            tag[r["datum"]] = tag.get(r["datum"], 0.0) + r["stunden"]
+        return result
+
+
 def _ausnahmen_map(mitarbeiter_id):
-    """{datum: brutto_stunden} der Ausnahmen eines Mitarbeiters."""
+    """{datum: brutto_stunden} der Ausnahmen (Mehrarbeit) eines Mitarbeiters."""
     return {r["datum"]: r["brutto_stunden"] for r in tagesarbeitszeit_liste(mitarbeiter_id)}
 
 
-def effektive_tageskapazitaet(mitarbeiter, datum, ausnahmen=None):
+def _abwesenheit_map(mitarbeiter_id):
+    """{datum: summe_stunden} der Abwesenheiten eines Mitarbeiters."""
+    result = {}
+    for r in abwesenheiten_liste(mitarbeiter_id):
+        result[r["datum"]] = result.get(r["datum"], 0.0) + r["stunden"]
+    return result
+
+
+def effektive_tageskapazitaet(mitarbeiter, datum, ausnahmen=None, abwesenheiten=None):
     """
     Effektive (auftragsbezogene) Kapazität eines Mitarbeiters an einem Tag.
 
-    Liegt für den Tag eine Brutto-Ausnahme vor, wird sie genutzt, sonst der
-    Standard (Wochenstunden/5). Auf den Brutto-Wert wird die Effektivität
-    angewandt.
+    Brutto verfügbar = (Mehrarbeits-Ausnahme oder Standard Wochenstunden/5)
+                       minus Summe der Abwesenheiten an dem Tag (nie unter 0).
+    Auf diesen Brutto-Wert wird die Effektivität angewandt.
     """
     if ausnahmen is None:
         ausnahmen = _ausnahmen_map(mitarbeiter["id"])
+    if abwesenheiten is None:
+        abwesenheiten = _abwesenheit_map(mitarbeiter["id"])
+
     if datum in ausnahmen:
         brutto = ausnahmen[datum]
     else:
         brutto = mitarbeiter["wochenstunden"] / 5.0
+
+    brutto = max(0.0, brutto - abwesenheiten.get(datum, 0.0))
     return brutto * (mitarbeiter["effektivitaet"] / 100.0)
 
 
-def verteile_stunden(mitarbeiter, tage, gesamt_stunden, ausnahmen=None):
+def verteile_stunden(mitarbeiter, tage, gesamt_stunden, ausnahmen=None,
+                     anteil_prozent=100, abwesenheiten=None):
     """
-    Verteilt 'gesamt_stunden' auf die gegebenen Arbeitstage PROPORTIONAL zur
-    effektiven Tageskapazität des Mitarbeiters. Ein Tag mit doppelter Kapazität
-    (z. B. Überstunden) bekommt doppelt so viele Stunden wie ein normaler Tag.
+    Verteilt 'gesamt_stunden' auf die Arbeitstage PROPORTIONAL zur effektiven
+    Tageskapazität. Ein Tag mit doppelter Kapazität (z. B. Überstunden) bekommt
+    doppelt so viele Stunden wie ein normaler Tag.
 
-    Beispiel: 88 h auf 10 Tage, davon 2 Tage à 12 h Kapazität und 8 Tage à 8 h:
-    -> die 12-h-Tage erhalten je 12 h, die 8-h-Tage je 8 h.
+    'anteil_prozent' ist ein Richtwert und deckelt, wie viel des Tages für DIESEN
+    Vorgang genutzt wird: pro Tag höchstens anteil_prozent% der Tageskapazität.
+    Passen dadurch nicht alle Stunden in den Zeitraum, werden die restlichen
+    Stunden auf den letzten Tag gelegt – die Überbuchungswarnung macht das dann
+    sichtbar (der Anteil ist bewusst kein harter Zwang).
 
-    Fällt die Gesamtkapazität auf 0 (z. B. alles Urlaub), wird als Rückfall
+    Abwesenheiten reduzieren die Tageskapazität (fließen über
+    effektive_tageskapazitaet ein). Fällt die Gesamtkapazität auf 0, wird
     gleichmäßig verteilt, damit keine Stunden verloren gehen.
 
     Rückgabe: {datum: stunden}
@@ -421,34 +571,54 @@ def verteile_stunden(mitarbeiter, tage, gesamt_stunden, ausnahmen=None):
         return {}
     if ausnahmen is None:
         ausnahmen = _ausnahmen_map(mitarbeiter["id"])
+    if abwesenheiten is None:
+        abwesenheiten = _abwesenheit_map(mitarbeiter["id"])
 
-    kapazitaeten = {d: effektive_tageskapazitaet(mitarbeiter, d, ausnahmen) for d in tage}
+    anteil = max(0.0, min(1.0, anteil_prozent / 100.0)) if anteil_prozent else 1.0
+    kapazitaeten = {
+        d: effektive_tageskapazitaet(mitarbeiter, d, ausnahmen, abwesenheiten) for d in tage
+    }
     summe = sum(kapazitaeten.values())
 
     if summe <= 0:
-        # kein Kapazitätsprofil -> gleichmäßig (Rückfalllösung)
         gleich = gesamt_stunden / len(tage)
         return {d: gleich for d in tage}
 
-    return {d: gesamt_stunden * (kapazitaeten[d] / summe) for d in tage}
+    # Proportional verteilen, aber pro Tag auf anteil% der Kapazität deckeln.
+    verteilung = {}
+    rest = gesamt_stunden
+    for d in tage:
+        soll = gesamt_stunden * (kapazitaeten[d] / summe)
+        deckel = kapazitaeten[d] * anteil
+        wert = min(soll, deckel)
+        verteilung[d] = wert
+        rest -= wert
+
+    # Wenn durch den Deckel Stunden übrig sind: dem letzten Tag zuschlagen,
+    # damit die Gesamtstunden erhalten bleiben (Überbuchung wird gewarnt).
+    if rest > 0.01 and tage:
+        verteilung[tage[-1]] += rest
+
+    return verteilung
 
 
 # --------------------------------------------------------------------------
 # Aufträge
 # --------------------------------------------------------------------------
 
-def auftrag_anlegen(auftragsnummer, titel, kunde, liefertermin, kommentar):
+def auftrag_anlegen(auftragsnummer, titel, kunde, liefertermin, kommentar, prioritaet="Normal"):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO auftraege (auftragsnummer, titel, kunde, liefertermin, kommentar, erstellt_am) "
-            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            "INSERT INTO auftraege (auftragsnummer, titel, kunde, liefertermin, kommentar, prioritaet, erstellt_am) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (
                 (auftragsnummer or "").strip() or None,
                 titel.strip(),
                 (kunde or "").strip() or None,
                 liefertermin,
                 (kommentar or "").strip() or None,
+                prioritaet or "Normal",
                 date.today().isoformat(),
             ),
         )
@@ -458,18 +628,19 @@ def auftrag_anlegen(auftragsnummer, titel, kunde, liefertermin, kommentar):
         return aid
 
 
-def auftrag_aktualisieren(aid, auftragsnummer, titel, kunde, liefertermin, kommentar):
+def auftrag_aktualisieren(aid, auftragsnummer, titel, kunde, liefertermin, kommentar, prioritaet="Normal"):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE auftraege SET auftragsnummer=%s, titel=%s, kunde=%s, liefertermin=%s, kommentar=%s "
-            "WHERE id=%s",
+            "UPDATE auftraege SET auftragsnummer=%s, titel=%s, kunde=%s, liefertermin=%s, "
+            "kommentar=%s, prioritaet=%s WHERE id=%s",
             (
                 (auftragsnummer or "").strip() or None,
                 titel.strip(),
                 (kunde or "").strip() or None,
                 liefertermin,
                 (kommentar or "").strip() or None,
+                prioritaet or "Normal",
                 aid,
             ),
         )
@@ -485,9 +656,17 @@ def auftrag_loeschen(aid):
         cur.close()
 
 
+# Sortierrang der Prioritätsstufen (Hoch zuerst)
+PRIO_RANG = {"Hoch": 0, "Normal": 1, "Niedrig": 2}
+
+
 def auftraege_liste():
     with get_cursor() as cur:
-        cur.execute("SELECT * FROM auftraege ORDER BY erstellt_am DESC, id DESC")
+        cur.execute(
+            "SELECT *, CASE prioritaet WHEN 'Hoch' THEN 0 WHEN 'Normal' THEN 1 "
+            "WHEN 'Niedrig' THEN 2 ELSE 1 END AS prio_rang "
+            "FROM auftraege ORDER BY prio_rang, liefertermin NULLS LAST, erstellt_am DESC, id DESC"
+        )
         rows = [dict(r) for r in cur.fetchall()]
         for r in rows:
             r["vorgaenge"] = vorgaenge_zu_auftrag(r["id"])
@@ -498,13 +677,14 @@ def auftraege_liste():
 # Vorgänge
 # --------------------------------------------------------------------------
 
-def vorgang_anlegen(auftrag_id, typ_id, stunden, start_datum, end_datum, skill_minlevel_map):
+def vorgang_anlegen(auftrag_id, typ_id, stunden, start_datum, end_datum, skill_minlevel_map,
+                    anteil_prozent=100):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO vorgaenge (auftrag_id, typ_id, stunden, start_datum, end_datum) "
-            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-            (auftrag_id, typ_id, float(stunden), start_datum, end_datum),
+            "INSERT INTO vorgaenge (auftrag_id, typ_id, stunden, anteil_prozent, start_datum, end_datum) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (auftrag_id, typ_id, float(stunden), float(anteil_prozent), start_datum, end_datum),
         )
         vid = cur.fetchone()[0]
         for skill_id, min_level in skill_minlevel_map.items():
@@ -518,12 +698,14 @@ def vorgang_anlegen(auftrag_id, typ_id, stunden, start_datum, end_datum, skill_m
         return vid
 
 
-def vorgang_aktualisieren(vid, typ_id, stunden, start_datum, end_datum, skill_minlevel_map):
+def vorgang_aktualisieren(vid, typ_id, stunden, start_datum, end_datum, skill_minlevel_map,
+                          anteil_prozent=100):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE vorgaenge SET typ_id=%s, stunden=%s, start_datum=%s, end_datum=%s WHERE id=%s",
-            (typ_id, float(stunden), start_datum, end_datum, vid),
+            "UPDATE vorgaenge SET typ_id=%s, stunden=%s, anteil_prozent=%s, "
+            "start_datum=%s, end_datum=%s WHERE id=%s",
+            (typ_id, float(stunden), float(anteil_prozent), start_datum, end_datum, vid),
         )
         cur.execute("DELETE FROM vorgang_skills WHERE vorgang_id = %s", (vid,))
         for skill_id, min_level in skill_minlevel_map.items():
@@ -632,18 +814,19 @@ def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
     """
     with get_cursor() as cur:
         cur.execute(
-            "SELECT id, stunden, start_datum, end_datum FROM vorgaenge "
+            "SELECT id, stunden, anteil_prozent, start_datum, end_datum FROM vorgaenge "
             "WHERE mitarbeiter_id = %s AND status = 'zugewiesen' "
             "AND start_datum IS NOT NULL AND end_datum IS NOT NULL",
             (mitarbeiter_id,),
         )
         vorgaenge = [dict(r) for r in cur.fetchall()]
 
-    # Mitarbeiterobjekt + Ausnahmen für die kapazitätsproportionale Verteilung
+    # Mitarbeiterobjekt + Ausnahmen + Abwesenheiten für die Verteilung
     m = next((x for x in mitarbeiter_liste() if x["id"] == mitarbeiter_id), None)
     if m is None:
         return {}
     ausnahmen = _ausnahmen_map(mitarbeiter_id)
+    abwesenheiten = _abwesenheit_map(mitarbeiter_id)
 
     jahre = set()
     for v in vorgaenge:
@@ -660,7 +843,8 @@ def _verplante_stunden_pro_tag(mitarbeiter_id, ausser_vorgang_id=None):
         tage = _arbeitstage(v["start_datum"], v["end_datum"], feiertage)
         if not tage:
             continue
-        for d, h in verteile_stunden(m, tage, v["stunden"], ausnahmen).items():
+        for d, h in verteile_stunden(m, tage, v["stunden"], ausnahmen,
+                                     v.get("anteil_prozent", 100), abwesenheiten).items():
             pro_tag[d] = pro_tag.get(d, 0.0) + h
     return pro_tag
 
@@ -672,7 +856,7 @@ def _bestand_alle_mitarbeiter():
     """
     with get_cursor() as cur:
         cur.execute(
-            "SELECT mitarbeiter_id, stunden, start_datum, end_datum FROM vorgaenge "
+            "SELECT mitarbeiter_id, stunden, anteil_prozent, start_datum, end_datum FROM vorgaenge "
             "WHERE status = 'zugewiesen' AND mitarbeiter_id IS NOT NULL "
             "AND start_datum IS NOT NULL AND end_datum IS NOT NULL"
         )
@@ -680,6 +864,7 @@ def _bestand_alle_mitarbeiter():
 
     ma_by_id = {m["id"]: m for m in mitarbeiter_liste()}
     alle_ausnahmen = _ausnahmen_alle_mitarbeiter()
+    alle_abwesenheiten = _abwesenheit_alle_mitarbeiter()
 
     jahre = set()
     for v in vorgaenge:
@@ -698,8 +883,10 @@ def _bestand_alle_mitarbeiter():
         if not tage:
             continue
         ausnahmen = alle_ausnahmen.get(v["mitarbeiter_id"], {})
+        abwesenheiten = alle_abwesenheiten.get(v["mitarbeiter_id"], {})
         pro_tag = result.setdefault(v["mitarbeiter_id"], {})
-        for d, h in verteile_stunden(m, tage, v["stunden"], ausnahmen).items():
+        for d, h in verteile_stunden(m, tage, v["stunden"], ausnahmen,
+                                     v.get("anteil_prozent", 100), abwesenheiten).items():
             pro_tag[d] = pro_tag.get(d, 0.0) + h
     return result
 
@@ -715,14 +902,14 @@ def _ausnahmen_alle_mitarbeiter():
 
 
 def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden,
-                              bestand=None, ausnahmen=None):
+                              bestand=None, ausnahmen=None, anteil_prozent=100,
+                              abwesenheiten=None):
     """
     Prüft, ob der Mitarbeiter im Zeitraum [start, ende] an Tagen über seine
-    effektive Tageskapazität käme, wenn 'zusatz_stunden' gleichmäßig auf die
-    Arbeitstage verteilt hinzukommen.
+    effektive Tageskapazität käme, wenn 'zusatz_stunden' hinzukommen.
 
-    bestand/ausnahmen können vorab geladen übergeben werden (Performance);
-    sonst werden sie für diesen einen Mitarbeiter nachgeladen.
+    bestand/ausnahmen/abwesenheiten können vorab geladen übergeben werden
+    (Performance); sonst werden sie für diesen einen Mitarbeiter nachgeladen.
 
     Rückgabe: Liste von (datum, geplante_stunden, kapazitaet) für Tage über Kapazität.
     """
@@ -737,15 +924,18 @@ def _ueberbuchung_im_zeitraum(mitarbeiter, start, ende, zusatz_stunden,
 
     if ausnahmen is None:
         ausnahmen = _ausnahmen_map(mitarbeiter["id"])
+    if abwesenheiten is None:
+        abwesenheiten = _abwesenheit_map(mitarbeiter["id"])
     if bestand is None:
         bestand = _verplante_stunden_pro_tag(mitarbeiter["id"])
 
-    # Neuen Vorgang ebenfalls kapazitätsproportional verteilen
-    zusatz_pro_tag = verteile_stunden(mitarbeiter, tage, zusatz_stunden, ausnahmen)
+    # Neuen Vorgang ebenfalls kapazitätsproportional verteilen (mit Anteil-Deckel)
+    zusatz_pro_tag = verteile_stunden(mitarbeiter, tage, zusatz_stunden, ausnahmen,
+                                      anteil_prozent, abwesenheiten)
 
     konflikte = []
     for d in tage:
-        kapazitaet = effektive_tageskapazitaet(mitarbeiter, d, ausnahmen)
+        kapazitaet = effektive_tageskapazitaet(mitarbeiter, d, ausnahmen, abwesenheiten)
         geplant = bestand.get(d, 0.0) + zusatz_pro_tag.get(d, 0.0)
         if geplant > kapazitaet + 0.01:
             konflikte.append((d, round(geplant, 1), round(kapazitaet, 1)))
@@ -789,10 +979,12 @@ def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
     gruppe_id = ziel.get("gruppe_id")
     start = ziel.get("start_datum")
     ende = ziel.get("end_datum")
+    anteil = ziel.get("anteil_prozent", 100)
 
     # Einmal gebündelt für ALLE Mitarbeiter laden (statt pro Kandidat)
     alle_bestaende = _bestand_alle_mitarbeiter()
     alle_ausnahmen = _ausnahmen_alle_mitarbeiter()
+    alle_abwesenheiten = _abwesenheit_alle_mitarbeiter()
 
     kandidaten = []
     for m in mitarbeiter_liste():
@@ -831,6 +1023,8 @@ def vorschlaege_fuer_vorgang(vorgang_id, top_n=5):
             m, start, ende, aufwand,
             bestand=alle_bestaende.get(m["id"], {}),
             ausnahmen=alle_ausnahmen.get(m["id"], {}),
+            anteil_prozent=anteil,
+            abwesenheiten=alle_abwesenheiten.get(m["id"], {}),
         )
 
         kandidaten.append({
@@ -878,32 +1072,40 @@ def _arbeitstage(start, ende, feiertage):
     return tage
 
 
-def tagesauslastung(jahr, monat):
+def tagesauslastung(jahr, monat, tage_davor=0, tage_danach=0):
     """
-    Berechnet je Mitarbeiter und Tag die geplanten Stunden im gegebenen Monat.
+    Berechnet je Mitarbeiter und Tag die geplanten Stunden im gegebenen Monat,
+    optional erweitert um 'tage_davor' Tage vor Monatsanfang und 'tage_danach'
+    Tage nach Monatsende (für einen Kalender, der über den Monat hinausschaut).
 
     Rückgabe:
       {
         "feiertage": {date: name},
         "mitarbeiter": [
             {"id", "name", "tageskapazitaet",
-             "tage": {date: {"stunden": float, "vorgaenge": [..], "deadlines": [..]}}}
-        ]
+             "tage": {date: {"stunden": float, "vorgaenge": [..], "deadlines": [..], "kapazitaet", "ausnahme"}}}
+        ],
+        "erster", "letzter"
       }
-    Die Stunden eines Vorgangs werden gleichmäßig über seine Arbeitstage verteilt.
     """
-    erster = date(jahr, monat, 1)
+    monatsanfang = date(jahr, monat, 1)
     if monat == 12:
-        letzter = date(jahr + 1, 1, 1) - timedelta(days=1)
+        monatsende = date(jahr + 1, 1, 1) - timedelta(days=1)
     else:
-        letzter = date(jahr, monat + 1, 1) - timedelta(days=1)
+        monatsende = date(jahr, monat + 1, 1) - timedelta(days=1)
 
-    feiertage = bw_feiertage(jahr)
+    erster = monatsanfang - timedelta(days=tage_davor)
+    letzter = monatsende + timedelta(days=tage_danach)
+
+    # Feiertage über alle Jahre im (evtl. erweiterten) Bereich
+    feiertage = {}
+    for j in range(erster.year, letzter.year + 1):
+        feiertage.update(bw_feiertage(j))
 
     # Alle zugewiesenen Vorgänge mit Datum holen
     with get_cursor() as cur:
         cur.execute(
-            "SELECT v.id, v.stunden, v.start_datum, v.end_datum, v.mitarbeiter_id, "
+            "SELECT v.id, v.stunden, v.anteil_prozent, v.start_datum, v.end_datum, v.mitarbeiter_id, "
             "       t.name AS typ_name, a.titel AS auftrag_titel, a.auftragsnummer, "
             "       a.liefertermin "
             "FROM vorgaenge v "
@@ -915,11 +1117,21 @@ def tagesauslastung(jahr, monat):
         vorgaenge = [dict(r) for r in cur.fetchall()]
 
     ma = mitarbeiter_liste()
+    alle_abwesenheiten = _abwesenheit_alle_mitarbeiter()
+    # Abwesenheiten mit Kategorie je Tag (für Anzeige/Tooltip)
+    abw_detail = {}
+    for a in abwesenheiten_liste():
+        abw_detail.setdefault(a["mitarbeiter_id"], {}).setdefault(a["datum"], []).append(
+            (a["kategorie_name"] or "Abwesend", a["stunden"])
+        )
+
     ergebnis = {m["id"]: {
         "id": m["id"], "name": m["name"],
         "tageskapazitaet": m["tageskapazitaet"],  # Standard (Fallback in der Anzeige)
         "_obj": m,
         "_ausnahmen": _ausnahmen_map(m["id"]),
+        "_abwesenheiten": alle_abwesenheiten.get(m["id"], {}),
+        "_abw_detail": abw_detail.get(m["id"], {}),
         "tage": {}
     } for m in ma}
 
@@ -936,8 +1148,10 @@ def tagesauslastung(jahr, monat):
             continue
         m_obj = ergebnis[mid]["_obj"]
         m_ausn = ergebnis[mid]["_ausnahmen"]
+        m_abw = ergebnis[mid]["_abwesenheiten"]
         # kapazitätsproportional über ALLE Arbeitstage des Vorgangs verteilen
-        verteilung = verteile_stunden(m_obj, arbeitstage, v["stunden"], m_ausn)
+        verteilung = verteile_stunden(m_obj, arbeitstage, v["stunden"], m_ausn,
+                                      v.get("anteil_prozent", 100), m_abw)
         for d, h in verteilung.items():
             if d < erster or d > letzter:
                 continue
@@ -953,25 +1167,28 @@ def tagesauslastung(jahr, monat):
                 f"Ende: {v['auftrag_titel']} – {v['typ_name'] or 'Vorgang'}"
             )
 
-    # Tagesgenaue Kapazität ergänzen – für alle Werktage im Monat, damit auch
-    # Ausnahmen ohne geplante Vorgänge (z. B. Urlaub = 0 h) sichtbar werden.
+    # Tagesgenaue Kapazität ergänzen – für alle Werktage im Bereich, damit auch
+    # Ausnahmen/Abwesenheiten ohne geplante Vorgänge sichtbar werden.
     d = erster
     while d <= letzter:
         if d.weekday() < 5 and d not in feiertage:
             for eintrag in ergebnis.values():
-                kap = effektive_tageskapazitaet(eintrag["_obj"], d, eintrag["_ausnahmen"])
+                kap = effektive_tageskapazitaet(
+                    eintrag["_obj"], d, eintrag["_ausnahmen"], eintrag["_abwesenheiten"]
+                )
                 slot = eintrag["tage"].setdefault(
                     d, {"stunden": 0.0, "vorgaenge": [], "deadlines": []}
                 )
                 slot["kapazitaet"] = kap
-                # markieren, ob für den Tag eine Ausnahme hinterlegt ist
                 slot["ausnahme"] = d in eintrag["_ausnahmen"]
+                # Abwesenheitsdetails für Anzeige/Tooltip
+                slot["abwesenheit"] = eintrag["_abw_detail"].get(d, [])
         d += timedelta(days=1)
 
     # interne Hilfsfelder entfernen
     for eintrag in ergebnis.values():
-        eintrag.pop("_obj", None)
-        eintrag.pop("_ausnahmen", None)
+        for k in ("_obj", "_ausnahmen", "_abwesenheiten", "_abw_detail"):
+            eintrag.pop(k, None)
 
     return {
         "feiertage": {d: n for d, n in feiertage.items() if erster <= d <= letzter},
