@@ -34,7 +34,13 @@ def passwort_ok():
 if not passwort_ok():
     st.stop()
 
-core.init_db()
+# Request-Cache zu Beginn jedes Durchlaufs leeren (frische Daten pro Klick)
+core.cache_reset()
+
+# Tabellen nur einmal pro Sitzung sicherstellen, nicht bei jedem Klick
+if not st.session_state.get("db_ready"):
+    core.init_db()
+    st.session_state["db_ready"] = True
 
 # --------------------------------------------------------------------------
 # Styling
