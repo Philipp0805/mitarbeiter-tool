@@ -64,6 +64,30 @@ def get_cursor():
 
 
 # --------------------------------------------------------------------------
+# Request-lokaler Cache
+#
+# Innerhalb EINES Streamlit-Skriptdurchlaufs (also eines Klicks) werden viele
+# Funktionen mehrfach mit denselben Daten aufgerufen – z. B. mitarbeiter_liste()
+# in jeder Vorschlagsberechnung. Dieser Cache hält solche Ergebnisse für die
+# Dauer eines Durchlaufs vor und wird zu dessen Beginn geleert (cache_reset()
+# in app.py), sodass jeder Klick garantiert frische Daten aus der DB sieht.
+# --------------------------------------------------------------------------
+
+_request_cache = {}
+
+
+def cache_reset():
+    """Zu Beginn jedes Streamlit-Durchlaufs aufrufen (leert den Request-Cache)."""
+    _request_cache.clear()
+
+
+def _cached(key, producer):
+    if key not in _request_cache:
+        _request_cache[key] = producer()
+    return _request_cache[key]
+
+
+# --------------------------------------------------------------------------
 # Setup
 # --------------------------------------------------------------------------
 
@@ -331,6 +355,10 @@ def mitarbeiter_loeschen(mid):
 
 
 def mitarbeiter_liste():
+    return _cached("mitarbeiter_liste", _mitarbeiter_liste_impl)
+
+
+def _mitarbeiter_liste_impl():
     with get_cursor() as cur:
         cur.execute(
             "SELECT m.*, g.name AS gruppe_name "
@@ -504,6 +532,10 @@ def abwesenheiten_liste(mitarbeiter_id=None):
 
 def _abwesenheit_alle_mitarbeiter():
     """{mitarbeiter_id: {datum: summe_stunden}} aller Abwesenheiten in einer Abfrage."""
+    return _cached("abw_alle", _abwesenheit_alle_impl)
+
+
+def _abwesenheit_alle_impl():
     with get_cursor() as cur:
         cur.execute("SELECT mitarbeiter_id, datum, stunden FROM abwesenheiten")
         result = {}
@@ -854,6 +886,10 @@ def _bestand_alle_mitarbeiter():
     {mitarbeiter_id: {date: stunden}} der zugewiesenen Vorgänge ALLER Mitarbeiter,
     kapazitätsproportional verteilt. Wenige Sammelabfragen statt einer pro Kandidat.
     """
+    return _cached("bestand_alle", _bestand_alle_impl)
+
+
+def _bestand_alle_impl():
     with get_cursor() as cur:
         cur.execute(
             "SELECT mitarbeiter_id, stunden, anteil_prozent, start_datum, end_datum FROM vorgaenge "
@@ -893,6 +929,10 @@ def _bestand_alle_mitarbeiter():
 
 def _ausnahmen_alle_mitarbeiter():
     """{mitarbeiter_id: {date: brutto_stunden}} aller Ausnahmen in einer Abfrage."""
+    return _cached("ausnahmen_alle", _ausnahmen_alle_impl)
+
+
+def _ausnahmen_alle_impl():
     with get_cursor() as cur:
         cur.execute("SELECT mitarbeiter_id, datum, brutto_stunden FROM tagesarbeitszeit")
         result = {}
