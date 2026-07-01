@@ -5,7 +5,6 @@ Reiter: Disposition · Aufträge · Kalender · Mitarbeiter · Stammdaten
 Start:  streamlit run app.py
 """
 
-import calendar
 from datetime import date, timedelta
 
 import streamlit as st
@@ -70,8 +69,8 @@ st.markdown(
 
 st.title("Disponent")
 
-tab_dispo, tab_auftraege, tab_kalender, tab_mitarbeiter, tab_stamm = st.tabs(
-    ["Disposition", "Aufträge", "Kalender", "Mitarbeiter", "Stammdaten"]
+tab_dispo, tab_auftraege, tab_kalender, tab_abw, tab_mitarbeiter, tab_stamm = st.tabs(
+    ["Disposition", "Aufträge", "Kalender", "Abwesenheiten", "Mitarbeiter", "Stammdaten"]
 )
 
 
@@ -79,7 +78,7 @@ tab_dispo, tab_auftraege, tab_kalender, tab_mitarbeiter, tab_stamm = st.tabs(
 # Tab: Stammdaten (Gruppen, Vorgangstypen, Fähigkeiten)
 # ==========================================================================
 with tab_stamm:
-    sp1, sp2, sp3 = st.columns(3)
+    sp1, sp2, sp3, sp4 = st.columns(4)
 
     with sp1:
         st.subheader("Gruppen")
@@ -127,6 +126,20 @@ with tab_stamm:
                 st.rerun()
         for s in core.skills_liste():
             st.markdown(f"<span class='pill'>{s['name']}</span>", unsafe_allow_html=True)
+
+    with sp4:
+        st.subheader("Abwesenheitsarten")
+        with st.form("abwkat_form", clear_on_submit=True):
+            kn = st.text_input("Neue Kategorie")
+            if st.form_submit_button("Hinzufügen") and kn.strip():
+                core.abwesenheitskategorie_anlegen(kn)
+                st.rerun()
+        for k in core.abwesenheitskategorien_liste():
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(f"<span class='pill'>{k['name']}</span>", unsafe_allow_html=True)
+            if c2.button("✕", key=f"delk_{k['id']}"):
+                core.abwesenheitskategorie_loeschen(k["id"])
+                st.rerun()
 
 
 # ==========================================================================
@@ -238,7 +251,7 @@ with tab_mitarbeiter:
 def _vorgang_editor(prefix, typen, skills, default=None):
     """Eingabefelder für einen Vorgang. Gibt dict mit den Werten zurück."""
     d = default or {}
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     typ_ids = [t["id"] for t in typen]
     if typ_ids:
         idx = typ_ids.index(d["typ_id"]) if d.get("typ_id") in typ_ids else 0
@@ -249,8 +262,11 @@ def _vorgang_editor(prefix, typen, skills, default=None):
         typ = None
         c1.info("Erst Vorgangstypen anlegen")
     std = c2.number_input("Stunden", 0.0, 9999.0, float(d.get("stunden", 8.0)), 0.5, key=f"{prefix}_std")
-    start = c3.date_input("Start", value=d.get("start_datum") or date.today(), key=f"{prefix}_start")
-    ende = c4.date_input("Ende", value=d.get("end_datum") or date.today(), key=f"{prefix}_ende")
+    anteil = c3.number_input("Anteil % / Tag", 5.0, 100.0, float(d.get("anteil_prozent", 100)), 5.0,
+                             key=f"{prefix}_anteil",
+                             help="Richtwert: höchstens so viel % der Tageskapazität für diesen Vorgang")
+    start = c4.date_input("Start", value=d.get("start_datum") or date.today(), key=f"{prefix}_start")
+    ende = c5.date_input("Ende", value=d.get("end_datum") or date.today(), key=f"{prefix}_ende")
 
     minlevel = {}
     if skills:
@@ -263,7 +279,8 @@ def _vorgang_editor(prefix, typen, skills, default=None):
             sname = next(s["name"] for s in skills if s["id"] == sid)
             minlevel[sid] = st.slider(f"Mindest-Level: {sname}", 1, 5, int(vorhanden.get(sid, 1)),
                                       key=f"{prefix}_lvl_{sid}")
-    return {"typ_id": typ, "stunden": std, "start": start, "ende": ende, "minlevel": minlevel}
+    return {"typ_id": typ, "stunden": std, "anteil": anteil,
+            "start": start, "ende": ende, "minlevel": minlevel}
 
 
 with tab_auftraege:
@@ -275,13 +292,14 @@ with tab_auftraege:
     a_nr = c1.text_input("Auftragsnummer", key="au_nr")
     a_titel = c2.text_input("Titel", key="au_titel")
     a_kunde = c3.text_input("Kunde", key="au_kunde")
-    c4, c5 = st.columns([1, 2])
+    c4, c5, c6 = st.columns([1, 1, 2])
     a_liefer = c4.date_input("Geplanter Liefertermin", value=date.today(), key="au_liefer")
-    a_kommentar = c5.text_input("Kommentar", key="au_kommentar")
+    a_prio = c5.selectbox("Priorität", ["Hoch", "Normal", "Niedrig"], index=1, key="au_prio")
+    a_kommentar = c6.text_input("Kommentar", key="au_kommentar")
 
     if st.button("Auftrag anlegen", key="au_save"):
         if a_titel.strip():
-            core.auftrag_anlegen(a_nr, a_titel, a_kunde, a_liefer, a_kommentar)
+            core.auftrag_anlegen(a_nr, a_titel, a_kunde, a_liefer, a_kommentar, a_prio)
             st.success(f"Auftrag „{a_titel}“ angelegt. Füge unten Vorgänge hinzu.")
             st.rerun()
         else:
@@ -302,7 +320,10 @@ with tab_auftraege:
             meta.append(a["kunde"])
         if a["liefertermin"]:
             meta.append(f"Liefertermin {a['liefertermin']}")
-        with st.expander(f"{a['auftragsnummer'] or ''} {a['titel']}  ·  {a['kunde'] or ''}".strip()):
+        meta.append(f"Priorität: {a.get('prioritaet', 'Normal')}")
+        prio_marker = {"Hoch": "🔴", "Normal": "", "Niedrig": "🔵"}.get(a.get("prioritaet", "Normal"), "")
+        titel_zeile = f"{prio_marker} {a['auftragsnummer'] or ''} {a['titel']}  ·  {a['kunde'] or ''}".strip()
+        with st.expander(titel_zeile):
             st.markdown(kopf)
             if meta:
                 st.caption(" · ".join(meta))
@@ -315,13 +336,17 @@ with tab_auftraege:
                 en = e1.text_input("Auftragsnummer", value=a["auftragsnummer"] or "", key=f"ea_nr_{a['id']}")
                 et = e2.text_input("Titel", value=a["titel"], key=f"ea_titel_{a['id']}")
                 ek = e3.text_input("Kunde", value=a["kunde"] or "", key=f"ea_kunde_{a['id']}")
-                e4, e5 = st.columns([1, 2])
+                e4, e5, e6 = st.columns([1, 1, 2])
                 el = e4.date_input("Liefertermin", value=a["liefertermin"] or date.today(), key=f"ea_liefer_{a['id']}")
-                eko = e5.text_input("Kommentar", value=a["kommentar"] or "", key=f"ea_kom_{a['id']}")
+                prio_opts = ["Hoch", "Normal", "Niedrig"]
+                ep = e5.selectbox("Priorität", prio_opts,
+                                  index=prio_opts.index(a.get("prioritaet", "Normal")) if a.get("prioritaet", "Normal") in prio_opts else 1,
+                                  key=f"ea_prio_{a['id']}")
+                eko = e6.text_input("Kommentar", value=a["kommentar"] or "", key=f"ea_kom_{a['id']}")
                 b1, b2 = st.columns(2)
                 if b1.button("Speichern", key=f"ea_save_{a['id']}"):
                     if et.strip():
-                        core.auftrag_aktualisieren(a["id"], en, et, ek, el, eko)
+                        core.auftrag_aktualisieren(a["id"], en, et, ek, el, eko, ep)
                         st.rerun()
                 if b2.button("Auftrag löschen", key=f"ea_del_{a['id']}"):
                     core.auftrag_loeschen(a["id"])
@@ -345,7 +370,8 @@ with tab_auftraege:
                     cc1, cc2 = st.columns(2)
                     if cc1.button("Speichern", key=f"ev_save_{v['id']}"):
                         core.vorgang_aktualisieren(v["id"], werte["typ_id"], werte["stunden"],
-                                                   werte["start"], werte["ende"], werte["minlevel"])
+                                                   werte["start"], werte["ende"], werte["minlevel"],
+                                                   werte["anteil"])
                         st.rerun()
                     if cc2.button("Vorgang löschen", key=f"ev_del_{v['id']}"):
                         core.vorgang_loeschen(v["id"])
@@ -356,7 +382,7 @@ with tab_auftraege:
             neu = _vorgang_editor(f"nv_{a['id']}", typen, skills)
             if st.button("Vorgang hinzufügen", key=f"nv_save_{a['id']}"):
                 core.vorgang_anlegen(a["id"], neu["typ_id"], neu["stunden"],
-                                     neu["start"], neu["ende"], neu["minlevel"])
+                                     neu["start"], neu["ende"], neu["minlevel"], neu["anteil"])
                 st.rerun()
 
 
@@ -457,17 +483,25 @@ with tab_kalender:
                          format_func=lambda mo: ["Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"][mo-1],
                          key="cal_monat")
 
-    daten = core.tagesauslastung(jahr, monat)
+    daten = core.tagesauslastung(jahr, monat, tage_davor=14, tage_danach=28)
     feiertage = daten["feiertage"]
 
     if feiertage:
-        st.caption("Feiertage (BW): " + " · ".join(f"{d.day}. {n}" for d, n in sorted(feiertage.items())))
+        st.caption("Feiertage (BW): " + " · ".join(f"{d.day}.{d.month}. {n}" for d, n in sorted(feiertage.items())))
 
-    tage_im_monat = calendar.monthrange(jahr, monat)[1]
-    alle_tage = [date(jahr, monat, t) for t in range(1, tage_im_monat + 1)]
+    # Erweiterter Bereich: 2 Wochen vor Monatsanfang bis 4 Wochen nach Monatsende
+    erster = daten["erster"]
+    letzter = daten["letzter"]
+    alle_tage = []
+    d = erster
+    while d <= letzter:
+        alle_tage.append(d)
+        d += timedelta(days=1)
     wochentage = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    monatskurz = ["Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"]
 
-    st.markdown("Auslastung je Mitarbeiter und Tag. Farbe zeigt das Verhältnis zur effektiven Tageskapazität.")
+    st.markdown("Auslastung je Mitarbeiter und Tag (2 Wochen vor bis 4 Wochen nach dem gewählten Monat). "
+                "Farbe zeigt das Verhältnis zur effektiven Tageskapazität.")
 
     def farbe(stunden, kapazitaet):
         if stunden <= 0:
@@ -481,14 +515,15 @@ with tab_kalender:
             return "#fbe9c4"   # gelb: voll
         return "#f6c0bf"       # rot: überlastet
 
-    # Kopfzeile
+    # Kopfzeile – bei Monatsersten den Monatsnamen zur Orientierung
     header = "<tr><th>Mitarbeiter</th>"
     for t in alle_tage:
         wt = wochentage[t.weekday()]
         ist_feiertag = t in feiertage
         ist_we = t.weekday() >= 5
         bg = "#e9ecef" if (ist_we or ist_feiertag) else "#eef1f4"
-        header += f"<th style='background:{bg}'>{t.day}<br><small>{wt}</small></th>"
+        monatslabel = f"<br><small>{monatskurz[t.month-1]}</small>" if t.day == 1 else ""
+        header += f"<th style='background:{bg}'>{t.day}<br><small>{wt}</small>{monatslabel}</th>"
     header += "</tr>"
 
     zeilen = ""
@@ -501,25 +536,40 @@ with tab_kalender:
             if ist_feiertag or ist_we:
                 zelle = "<td style='background:#e9ecef'></td>"
             else:
-                # tagesgenaue Kapazität (Ausnahme überschreibt Standard)
+                # tagesgenaue Kapazität (Ausnahme/Abwesenheit berücksichtigt)
                 kap = info.get("kapazitaet", m["tageskapazitaet"]) if info else m["tageskapazitaet"]
                 ausnahme = info.get("ausnahme") if info else False
                 stunden = info["stunden"] if info else 0.0
+                abw = info.get("abwesenheit", []) if info else []
+
+                # Kürzel + Tooltip für Abwesenheiten
+                abw_kuerzel = ""
+                abw_tip = ""
+                if abw:
+                    abw_kuerzel = "/".join(k[:2] for k, _ in abw)  # z. B. "Ur", "Be"
+                    abw_tip = ", ".join(f"{k} {h:.1f}h" for k, h in abw)
 
                 if kap <= 0:
-                    # z. B. Urlaub: keine Kapazität
-                    inhalt = "U" if ausnahme else ""
-                    zelle = f"<td style='background:#dfe3e8' title='keine Kapazität (z. B. Urlaub)'>{inhalt}</td>"
+                    # keine Kapazität (z. B. ganztägig abwesend)
+                    inhalt = abw_kuerzel or ("U" if ausnahme else "")
+                    tip = abw_tip or "keine Kapazität"
+                    zelle = f"<td style='background:#dfe3e8' title='{tip}'>{inhalt}</td>"
                 elif stunden > 0:
                     bg = farbe(stunden, kap)
                     deadline = "🚩" if info["deadlines"] else ""
-                    rand = "border:2px solid #7a8699;" if ausnahme else ""
+                    rand = "border:2px solid #7a8699;" if (ausnahme or abw) else ""
                     titel = " | ".join(info["vorgaenge"]) + f" (Kap. {kap:.1f} h)"
+                    if abw_tip:
+                        titel += f" · abwesend: {abw_tip}"
+                    marker = f"<sup style='color:#7a3fb3'>{abw_kuerzel}</sup>" if abw_kuerzel else ""
                     zelle = (f"<td style='background:{bg};{rand}' title='{titel}'>"
-                             f"{stunden:.1f}{deadline}</td>")
+                             f"{stunden:.1f}{deadline}{marker}</td>")
                 else:
-                    # frei, aber evtl. mit reduzierter Kapazität (Ausnahme)
-                    if ausnahme:
+                    # frei; ggf. mit reduzierter Kapazität (Ausnahme/Abwesenheit)
+                    if abw:
+                        zelle = (f"<td style='border:2px solid #7a8699' title='{abw_tip} · Rest {kap:.1f} h'>"
+                                 f"<small>{abw_kuerzel} {kap:.0f}h</small></td>")
+                    elif ausnahme:
                         zelle = f"<td style='border:2px solid #7a8699' title='reduziert: {kap:.1f} h'><small>{kap:.0f}h</small></td>"
                     else:
                         zelle = "<td></td>"
@@ -536,17 +586,70 @@ with tab_kalender:
                    "dicker Rahmen = abweichende Arbeitszeit hinterlegt. "
                    "Grün = locker, Gelb = voll, Rot = über Kapazität.")
 
-        # --- Tagesarbeitszeit direkt im Kalender setzen ---
-        st.markdown("**Arbeitszeit für einen Tag anpassen**")
+        # --- Abwesenheit direkt im Kalender setzen ---
+        st.markdown("**Abwesenheit für einen Tag eintragen**")
         alle_ma = core.mitarbeiter_liste()
-        k1, k2, k3, k4 = st.columns([3, 2, 2, 1])
+        kats = core.abwesenheitskategorien_liste()
+        k1, k2, k3, k4, k5 = st.columns([3, 2, 2, 2, 1])
         msel = k1.selectbox("Mitarbeiter", options=[mm["id"] for mm in alle_ma],
                             format_func=lambda mid: next(mm["name"] for mm in alle_ma if mm["id"] == mid),
                             key="cal_ma") if alle_ma else None
-        kdatum = k2.date_input("Tag", value=daten["erster"], key="cal_axd")
-        kstd = k3.number_input("Brutto-Stunden", 0.0, 24.0, 0.0, 0.5, key="cal_axs")
-        if k4.button("Setzen", key="cal_axset") and msel:
-            core.tagesarbeitszeit_setzen(msel, kdatum, kstd)
+        kdatum = k2.date_input("Tag", value=daten["erster"], key="cal_abwd")
+        kkat = k3.selectbox("Kategorie", options=[kk["id"] for kk in kats],
+                            format_func=lambda kid: next(kk["name"] for kk in kats if kk["id"] == kid),
+                            key="cal_abwk") if kats else None
+        kstd = k4.number_input("Stunden", 0.0, 24.0, 8.0, 0.5, key="cal_abws")
+        if k5.button("Setzen", key="cal_abwset") and msel and kkat:
+            core.abwesenheit_setzen(msel, kdatum, kstd, kkat)
             st.rerun()
+        st.caption("Mehrarbeit/Überstunden (mehr als der Standard) trägst du im "
+                   "Tab „Mitarbeiter“ unter „Abweichende Arbeitszeit“ ein.")
     else:
         st.info("Noch keine Mitarbeiter angelegt.")
+
+
+# ==========================================================================
+# Tab: Abwesenheiten
+# ==========================================================================
+with tab_abw:
+    st.subheader("Abwesenheiten")
+    st.caption("Eingetragene Stunden reduzieren die verfügbare Arbeitszeit des Tages. "
+               "Kategorien lassen sich im Tab „Stammdaten“ pflegen.")
+
+    ma = core.mitarbeiter_liste()
+    kats = core.abwesenheitskategorien_liste()
+
+    if not ma:
+        st.warning("Lege zuerst im Tab „Mitarbeiter“ Personen an.")
+    elif not kats:
+        st.warning("Lege zuerst im Tab „Stammdaten“ Abwesenheitskategorien an.")
+    else:
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 1])
+        a_ma = c1.selectbox("Mitarbeiter", options=[m["id"] for m in ma],
+                            format_func=lambda mid: next(m["name"] for m in ma if m["id"] == mid),
+                            key="abw_ma")
+        a_datum = c2.date_input("Tag", value=date.today(), key="abw_datum")
+        a_kat = c3.selectbox("Kategorie", options=[k["id"] for k in kats],
+                             format_func=lambda kid: next(k["name"] for k in kats if k["id"] == kid),
+                             key="abw_kat")
+        a_std = c4.number_input("Stunden", 0.0, 24.0, 8.0, 0.5, key="abw_std")
+        if c5.button("Eintragen", key="abw_add"):
+            core.abwesenheit_setzen(a_ma, a_datum, a_std, a_kat)
+            st.rerun()
+
+        st.divider()
+        # Übersicht, gefiltert nach ausgewähltem Mitarbeiter
+        name_sel = next(m["name"] for m in ma if m["id"] == a_ma)
+        st.markdown(f"**Einträge für {name_sel}**")
+        eintraege = core.abwesenheiten_liste(a_ma)
+        if not eintraege:
+            st.caption("Keine Abwesenheiten hinterlegt.")
+        for e in eintraege:
+            d1, d2, d3, d4 = st.columns([2, 2, 2, 1])
+            d1.markdown(e["datum"].strftime("%a %d.%m.%Y"))
+            d2.markdown(f"<span class='pill'>{e['kategorie_name'] or 'Abwesend'}</span>",
+                        unsafe_allow_html=True)
+            d3.markdown(f"{e['stunden']:.1f} h")
+            if d4.button("✕", key=f"abwdel_{e['id']}"):
+                core.abwesenheit_loeschen(e["id"])
+                st.rerun()
